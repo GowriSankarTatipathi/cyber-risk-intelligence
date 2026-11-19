@@ -18,6 +18,7 @@ from cyber_risk_intelligence.models import EvidenceVersion, PageFetch, SecurityC
 from cyber_risk_intelligence.quality import run_validation
 
 from . import factories as f
+from .pdfmaker import make_pdf
 
 FIXTURE = (Path(__file__).parent / "fixtures" / "trust_center" / "acme_trust.html").read_bytes()
 URL = "https://trust.acme.example/security"
@@ -235,7 +236,9 @@ def test_classify_http_outcomes():
     assert classify(URL, 401, URL, html, b"").outcome == "login_required"
     assert classify(URL, 200, "https://acme.example/login?next=/security", html, b"").outcome == "login_required"
     assert classify(URL, 429, URL, html, b"").outcome == "rate_limited"
-    assert classify(URL, 200, URL, "application/pdf", b"%PDF").outcome == "not_html"
+    assert classify(URL, 200, URL, "application/pdf", b"%PDF-1.4").outcome == "captured"
+    assert classify(URL, 200, URL, "application/octet-stream", b"%PDF-1.7 ...").content_type == "application/pdf"
+    assert classify(URL, 200, URL, "image/png", b"\x89PNG").outcome == "not_html"
 
 
 def test_http_fetcher_obeys_robots_backs_off_and_identifies_itself():
@@ -257,3 +260,53 @@ def test_http_fetcher_obeys_robots_backs_off_and_identifies_itself():
     paths = [p for p, _ in seen]
     assert paths == ["/robots.txt", "/security", "/busy"]  # private page and backed-off host never requested
     assert {ua for _, ua in seen} == {"test-agent/1.0"}
+
+
+# --- PDFs ------------------------------------------------------------------------------------------
+
+POLICY_PDF = make_pdf(
+    [["Acme Information Security Policy", "Customer data is encrypted at rest using AES-256.",
+      "All employees complete security awareness training every year."],
+     ["Our platform holds a SOC 2 Type II report and ISO 27001 certification.",
+      "Administrators must use multi-factor authentication."]],
+    title="Acme Information Security Policy", created="D:20250301090000Z", modified="D:20250610120000Z")
+PDF_URL = "https://acme.example/docs/security-policy.pdf"
+
+
+def test_pdf_claims_cite_their_page():
+    page = extract(POLICY_PDF)
+    assert page.title == "Acme Information Security Policy"
+    assert page.published_at == datetime(2025, 3, 1, 9, tzinfo=UTC) and page.updated_on == date(2025, 6, 10)
+    found = {(c.category, c.qualifier, c.section_heading) for c in page.claims}
+    assert {("encryption_at_rest", "AES-256", "page 1"), ("security_training", None, "page 1"),
+            ("compliance_certification", "SOC 2 Type II", "page 2"),
+            ("compliance_certification", "ISO/IEC 27001", "page 2"), ("mfa", None, "page 2")} <= found
+    rest = next(c for c in page.claims if c.category == "encryption_at_rest")
+    assert rest.claim_text == "Customer data is encrypted at rest using AES-256."
+
+
+def test_unreadable_pdf_yields_no_claims_instead_of_failing():
+    assert extract(b"%PDF-1.4 this is not really a pdf").claims == []
+
+
+def test_pdf_is_stored_and_its_claims_collected(session_factory, store, acme):
+    pdf = FetchResult("captured", PDF_URL, PDF_URL, 200, "application/pdf", POLICY_PDF)
+    job = TrustCenterJob(store, FakeFetcher({PDF_URL: pdf}))
+    run_import(session_factory, store, job, targets(["acme", PDF_URL, "security"]), source_url="file:///t.csv")
+    [fetch] = fetches(session_factory)
+    assert fetch.outcome == "captured" and fetch.claims_found >= 5
+    with session_factory() as s:
+        version = s.get(EvidenceVersion, fetch.evidence_version_id)
+        assert read_evidence(s, store, version) == POLICY_PDF  # the original PDF, byte for byte
+        assert version.evidence_object.media_type == "application/pdf"
+    assert {c.page_updated_on for c in claims(session_factory)} == {date(2025, 6, 10)}
+
+
+def test_pdf_with_a_credential_in_its_text_is_withheld(session_factory, store, acme):
+    leaky = make_pdf([["Security policy. Encrypted at rest.", "Service account password = CorrectHorse99"]])
+    pdf = FetchResult("captured", PDF_URL, PDF_URL, 200, "application/pdf", leaky)
+    job = TrustCenterJob(store, FakeFetcher({PDF_URL: pdf}))
+    run_import(session_factory, store, job, targets(["acme", PDF_URL, "security"]), source_url="file:///t.csv")
+    [fetch] = fetches(session_factory)
+    assert fetch.outcome == "withheld" and fetch.evidence_version_id is None
+    assert "CorrectHorse99" not in fetch.message and claims(session_factory) == []
