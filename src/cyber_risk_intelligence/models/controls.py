@@ -88,6 +88,8 @@ class PageFetch(IdMixin, Base):
     )
     claims_found: Mapped[int | None] = mapped_column(Integer)
     message: Mapped[str | None] = mapped_column(Text)
+    # sha256 of the readable text; a capture with the same text as the last one is "not_modified".
+    text_sha256: Mapped[str | None] = mapped_column(Text, comment="sha256 of the page's readable text; NULL if not read")
 
     target: Mapped[CollectionTarget] = relationship(back_populates="fetches")
 
@@ -98,6 +100,7 @@ class PageFetch(IdMixin, Base):
             "WHEN outcome = 'not_html' THEN true ELSE evidence_version_id IS NULL END",
             name="evidence_matches_outcome",
         ),
+        CheckConstraint("text_sha256 IS NULL OR text_sha256 ~ '^[0-9a-f]{64}$'", name="text_sha256_hex"),
         CheckConstraint("http_status IS NULL OR http_status BETWEEN 100 AND 599", name="http_status"),
     )
 

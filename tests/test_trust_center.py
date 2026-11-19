@@ -419,3 +419,33 @@ def test_unreadable_pdf_does_not_stop_the_run(session_factory, store, acme, monk
     assert run.status == "succeeded"
     [fetch] = fetches(session_factory)
     assert fetch.outcome == "captured" and fetch.claims_found == 0  # stored, can be read again later
+
+
+# --- telling real changes from changed page code ----------------------------------------------------
+
+def _with_nonce(n: int) -> bytes:
+    return FIXTURE.replace(b"</body>", b'<script>window.nonce="%d"</script><span hidden data-ts="%d"></span></body>' % (n, n))
+
+
+def test_page_with_only_changed_code_is_not_modified(session_factory, store, acme):
+    t = targets(["acme", URL, "trust_center"])
+    for n in (1, 2, 3):  # tracking code / timestamp differs on every visit, the words don't
+        run = run_import(session_factory, store, TrustCenterJob(store, FakeFetcher({URL: _with_nonce(n)})), t,
+                         source_url="file:///t.csv")
+    assert run.rows_unchanged == 1
+    assert [x.outcome for x in fetches(session_factory)] == ["captured", "not_modified", "not_modified"]
+    assert len({x.evidence_version_id for x in fetches(session_factory)}) == 1  # one stored copy
+    assert len(claims(session_factory)) == len(EXPECTED)  # no duplicate claims
+    assert fetches(session_factory)[-1].claims_found == len(EXPECTED)
+
+
+def test_captures_from_before_fingerprints_are_compared_too(session_factory, store, acme):
+    t = targets(["acme", URL, "trust_center"])
+    run_import(session_factory, store, TrustCenterJob(store, FakeFetcher({URL: _with_nonce(1)})), t, source_url="file:///t.csv")
+    with session_factory() as s:  # as if captured by an older version of the collector
+        s.execute(PageFetch.__table__.update().values(text_sha256=None))
+        s.commit()
+    run_import(session_factory, store, TrustCenterJob(store, FakeFetcher({URL: _with_nonce(2)})), t, source_url="file:///t.csv")
+    assert [x.outcome for x in fetches(session_factory)] == ["captured", "not_modified"]
+    assert all(x.text_sha256 for x in fetches(session_factory))  # the old row was filled in
+    assert len(claims(session_factory)) == len(EXPECTED)

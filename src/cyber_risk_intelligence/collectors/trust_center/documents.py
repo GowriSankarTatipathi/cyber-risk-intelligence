@@ -265,3 +265,15 @@ def _json_sections(data, path: str = "") -> list[tuple[str | None, str]]:
             text = BeautifulSoup(text, "html.parser").get_text(" ")
         out.append((path or None, _squash(text)))
     return out
+
+
+def readable_text(content: bytes, kind: str) -> str:
+    """What a reader sees, whitespace-normalised: used to tell real changes from changed page code."""
+    if kind == "html":
+        from bs4 import BeautifulSoup
+
+        soup = BeautifulSoup(content, "html.parser")
+        for junk in soup(["script", "style", "noscript", "template", "svg", "iframe"]):
+            junk.decompose()
+        return _squash(soup.get_text(" "))
+    return _squash(document_text(content, kind))
