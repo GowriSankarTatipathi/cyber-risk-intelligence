@@ -235,3 +235,11 @@ def test_bad_register_rows_are_rejected(session_factory, store, acme):
     assert codes == sorted(["directory_known", "directory_known", "directory_known", "unknown_company",
                             "framework_known", "dates_valid", "report_type_valid", "status_known"])
     assert rows(session_factory) == []
+
+
+def test_same_sentence_on_several_captures_counts_once(session_factory, store, acme):
+    collect(session_factory, store)
+    collect(session_factory, store, {PAGE_URL: ("text/html", PAGE.replace(b"Compliance</title>", b"Compliance v2</title>"))})
+    claim_rows = [r for r in rows(session_factory) if r.basis == "company_claim" and r.framework == "SOC 2"]
+    assert len(claim_rows) == 2  # each capture keeps its own row
+    assert summary(session_factory)["SOC 2", "Type II"].company_claims == 1  # but it is one statement
