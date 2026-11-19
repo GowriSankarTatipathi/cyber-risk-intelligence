@@ -4,8 +4,8 @@
 * Obeys robots.txt; a disallowed page is reported, not fetched.
 * Waits between requests to the same host, and stops calling a host for the
   rest of the run after it answers 429.
-* Only fetches http(s). Reads web pages and PDFs; gives up on pages over 5 MB
-  and PDFs over 30 MB.
+* Only fetches http(s). Reads web pages and documents (PDF, Office, text, JSON);
+  gives up on pages over 5 MB and on PDF/Office files over 30 MB.
 """
 
 from __future__ import annotations
@@ -27,7 +27,7 @@ LOGIN_HINTS = ("login", "signin", "sign-in", "sign_in", "auth", "sso", "account"
 
 @dataclass(frozen=True)
 class FetchResult:
-    outcome: str  # captured (web page or PDF) | unavailable | login_required | blocked_by_robots | rate_limited | not_html
+    outcome: str  # captured (page or readable document) | unavailable | login_required | blocked_by_robots | rate_limited | not_html
     url: str
     final_url: str | None = None
     http_status: int | None = None
@@ -49,13 +49,14 @@ def classify(url: str, status: int, final_url: str, content_type: str, content: 
                            message="page requires sign-in; nothing is known about the controls it describes")
     if status >= 400:
         return FetchResult("unavailable", url, final_url, status, message=f"HTTP {status}")
+    from .documents import MEDIA_TYPES, detect_kind
+
     ctype = (content_type or "").split(";")[0].strip().lower()
-    if ctype == "application/pdf" or content.lstrip()[:5] == b"%PDF-":
-        return FetchResult("captured", url, final_url, status, "application/pdf", content)
-    if ctype not in ("text/html", "application/xhtml+xml"):
+    kind = detect_kind(content, ctype, final_url)
+    if kind is None:
         return FetchResult("not_html", url, final_url, status, ctype, content,
-                           message=f"{ctype or 'unknown type'} is stored but not parsed yet")
-    return FetchResult("captured", url, final_url, status, ctype, content)
+                           message=f"{ctype or 'unknown type'} is stored but not parsed")
+    return FetchResult("captured", url, final_url, status, ctype if kind == "html" else MEDIA_TYPES[kind], content)
 
 
 class HttpFetcher:
@@ -105,14 +106,16 @@ class HttpFetcher:
         self._wait(parts.netloc)
         try:
             with self.client.stream("GET", url) as r:
-                is_pdf = "pdf" in r.headers.get("content-type", "").lower() or url.lower().split("?")[0].endswith(".pdf")
+                is_pdf = ("pdf" in r.headers.get("content-type", "").lower()
+                          or "officedocument" in r.headers.get("content-type", "").lower()
+                          or url.lower().split("?")[0].endswith((".pdf", ".docx", ".pptx", ".xlsx")))
                 limit = MAX_PDF_BYTES if is_pdf else MAX_BYTES
                 body = b""
                 for chunk in r.iter_bytes():
                     body += chunk
                     if len(body) > limit:
                         return FetchResult("unavailable", url, str(r.url), r.status_code,
-                                           message=f"{'PDF' if is_pdf else 'page'} larger than "
+                                           message=f"{'document' if is_pdf else 'page'} larger than "
                                                    f"{limit // (1024 * 1024)} MB; skipped")
                 result = classify(url, r.status_code, str(r.url), r.headers.get("content-type", ""), body)
         except httpx.HTTPError as exc:

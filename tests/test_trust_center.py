@@ -11,6 +11,7 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 
 from cyber_risk_intelligence.collectors.trust_center import HttpFetcher, TrustCenterJob, classify, extract
+from cyber_risk_intelligence.collectors.trust_center.documents import detect_kind, extract_document
 from cyber_risk_intelligence.collectors.trust_center.fetch import FetchResult
 from cyber_risk_intelligence.evidence import LocalStore, read_evidence
 from cyber_risk_intelligence.ingest import run_import
@@ -18,6 +19,7 @@ from cyber_risk_intelligence.models import EvidenceVersion, PageFetch, SecurityC
 from cyber_risk_intelligence.quality import run_validation
 
 from . import factories as f
+from .docmaker import make_docx, make_pptx, make_xlsx
 from .pdfmaker import make_pdf
 
 FIXTURE = (Path(__file__).parent / "fixtures" / "trust_center" / "acme_trust.html").read_bytes()
@@ -310,3 +312,84 @@ def test_pdf_with_a_credential_in_its_text_is_withheld(session_factory, store, a
     [fetch] = fetches(session_factory)
     assert fetch.outcome == "withheld" and fetch.evidence_version_id is None
     assert "CorrectHorse99" not in fetch.message and claims(session_factory) == []
+
+
+# --- other document formats ------------------------------------------------------------------------
+
+DOCX = make_docx([("Title", "Acme Security Whitepaper"), ("Heading1", "Data protection"),
+                  (None, "Customer data is encrypted at rest using AES-256."),
+                  (None, "We maintain a SOC 2 Type II report.")],
+                 title="Acme Security Whitepaper", created="2025-03-01T09:00:00Z", modified="2025-06-10T12:00:00Z")
+
+
+def test_detects_formats_by_content_type_extension_and_signature():
+    assert detect_kind(DOCX) == "docx"
+    assert detect_kind(make_pptx([["x"]])) == "pptx" and detect_kind(make_xlsx([["x"]])) == "xlsx"
+    assert detect_kind(b"%PDF-1.7") == "pdf"
+    assert detect_kind(b"Contact: mailto:security@acme.example", "text/plain") == "text"
+    assert detect_kind(b"# Security", "application/octet-stream", "https://acme.example/SECURITY.md") == "markdown"
+    assert detect_kind(b"{}", "application/json") == "json"
+    assert detect_kind(b"<p>x</p>", "text/html; charset=utf-8") == "html"
+    assert detect_kind(b"\x89PNG...", "image/png") is None
+    assert detect_kind(b"not a zip", MEDIA_DOCX := "application/vnd.openxmlformats-officedocument.wordprocessingml.document") is None
+    assert MEDIA_DOCX
+
+
+def test_word_document_claims_keep_their_heading_and_dates():
+    page = extract_document(DOCX, "docx")
+    assert page.title == "Acme Security Whitepaper"
+    assert page.published_at == datetime(2025, 3, 1, 9, tzinfo=UTC) and page.updated_on == date(2025, 6, 10)
+    by_cat = {c.category: c for c in page.claims}
+    assert by_cat["encryption_at_rest"].qualifier == "AES-256"
+    assert by_cat["encryption_at_rest"].section_heading == "Data protection"
+    assert by_cat["compliance_certification"].qualifier == "SOC 2 Type II"
+
+
+def test_slides_spreadsheets_text_markdown_and_json():
+    slides = extract_document(make_pptx([["Security overview"], ["All admins use multi-factor authentication."]]), "pptx")
+    assert [(c.category, c.section_heading) for c in slides.claims] == [("mfa", "slide 2")]
+
+    caiq = make_xlsx([["Question", "Answer"],
+                      ["Is data encrypted at rest?", "Yes, AES-256 for all customer data"],
+                      ["Do you run penetration tests?", "Annually, by an independent firm"]])
+    sheet = {(c.category, c.section_heading) for c in extract_document(caiq, "xlsx").claims}
+    assert {("encryption_at_rest", "Questionnaire row 2"), ("penetration_testing", "Questionnaire row 3")} <= sheet
+    row = next(c for c in extract_document(caiq, "xlsx").claims if c.category == "penetration_testing")
+    assert row.claim_text == "Do you run penetration tests? | Annually, by an independent firm"
+
+    txt = extract_document(b"Contact: mailto:security@acme.example\nPolicy: https://acme.example/policy\n\n"
+                           b"We run a responsible disclosure program.\n", "text")
+    assert {c.category for c in txt.claims} == {"bug_bounty"}  # the https:// link is not a TLS claim
+
+    md = extract_document(b"# Security at Acme\n\n## Access\n\n- We enforce **least privilege** and quarterly access reviews.\n", "markdown")
+    assert md.title == "Security at Acme"
+    assert [(c.category, c.section_heading) for c in md.claims] == [("access_control", "Access")]
+
+    js = extract_document(b'{"policy": {"text": "<p>We run a bug bounty program on HackerOne.</p>"}}', "json")
+    assert [(c.category, c.section_heading) for c in js.claims] == [("bug_bounty", "policy.text")]
+
+
+def test_broken_documents_give_no_claims_instead_of_failing():
+    for kind in ("docx", "pptx", "xlsx", "json"):
+        assert extract_document(b"PK\x03\x04 garbage", kind).claims == []
+
+
+def test_word_document_is_collected(session_factory, store, acme):
+    url = "https://acme.example/security-whitepaper.docx"
+    doc = FetchResult("captured", url, url, 200, "application/vnd.openxmlformats-officedocument.wordprocessingml.document", DOCX)
+    run_import(session_factory, store, TrustCenterJob(store, FakeFetcher({url: doc})),
+               targets(["acme", url, "security"]), source_url="file:///t.csv")
+    [fetch] = fetches(session_factory)
+    assert fetch.outcome == "captured" and fetch.claims_found == 2
+    with session_factory() as s:
+        assert read_evidence(s, store, s.get(EvidenceVersion, fetch.evidence_version_id)) == DOCX
+
+
+def test_office_file_with_a_credential_in_its_text_is_withheld(session_factory, store, acme):
+    url = "https://acme.example/runbook.docx"
+    leaky = make_docx([(None, "Encrypted at rest."), (None, "Admin password = CorrectHorse99")])
+    doc = FetchResult("captured", url, url, 200, "application/octet-stream", leaky)
+    run_import(session_factory, store, TrustCenterJob(store, FakeFetcher({url: doc})),
+               targets(["acme", url, "security"]), source_url="file:///t.csv")
+    [fetch] = fetches(session_factory)
+    assert fetch.outcome == "withheld" and claims(session_factory) == []
