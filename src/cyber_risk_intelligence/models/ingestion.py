@@ -21,7 +21,7 @@ from .base import Base, IdMixin, in_list
 
 RUN_STATUSES = ("running", "succeeded", "partial", "failed")
 ERROR_STAGES = ("parse", "validate", "write", "run")
-SEVERITIES = ("error", "warning")
+SEVERITIES = ("error", "warning", "info")
 
 
 class DataVersion(IdMixin, Base):
@@ -108,20 +108,28 @@ class IngestionError(IdMixin, Base):
 
 
 class ValidationResult(IdMixin, Base):
+    """Outcome of one rule, either for an import run (17.8) or a database-wide validation run (27.7)."""
+
     __tablename__ = "validation_results"
 
-    run_id: Mapped[int] = mapped_column(
-        BigInteger, ForeignKey("ingestion_runs.id", ondelete="CASCADE"), nullable=False, index=True
+    run_id: Mapped[int | None] = mapped_column(
+        BigInteger, ForeignKey("ingestion_runs.id", ondelete="CASCADE"), index=True
+    )
+    validation_run_id: Mapped[int | None] = mapped_column(
+        BigInteger, ForeignKey("validation_runs.id", ondelete="CASCADE"), index=True
     )
     rule: Mapped[str] = mapped_column(Text, nullable=False)
     severity: Mapped[str] = mapped_column(Text, nullable=False)
     rows_checked: Mapped[int] = mapped_column(Integer, nullable=False)
     rows_failed: Mapped[int] = mapped_column(Integer, nullable=False)
+    description: Mapped[str | None] = mapped_column(Text)
 
-    run: Mapped[IngestionRun] = relationship(back_populates="validation_results")
+    run: Mapped[IngestionRun | None] = relationship(back_populates="validation_results")
 
     __table_args__ = (
         UniqueConstraint("run_id", "rule", name="uq_validation_results_rule"),
+        UniqueConstraint("validation_run_id", "rule", name="uq_validation_results_validation_rule"),
+        CheckConstraint("num_nonnulls(run_id, validation_run_id) = 1", name="exactly_one_run"),
         CheckConstraint(in_list("severity", SEVERITIES), name="severity"),
         CheckConstraint("rows_failed BETWEEN 0 AND rows_checked", name="failed_le_checked"),
     )
