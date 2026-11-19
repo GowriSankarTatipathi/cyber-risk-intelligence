@@ -18,6 +18,7 @@ from urllib.parse import urlsplit
 from sqlalchemy import func, select
 
 from ... import assurance
+from ...backup.derive import from_claim as backup_from_claim
 from ...evidence import SecretDetected, find_secrets, read_evidence, record_evidence
 from ...evidence.store import ObjectStore, sha256_hex
 from ...ingest.framework import InputRow, Job, RowRejected, RowStatus, Rule, SourceSpec, WriteContext, ensure_source
@@ -182,6 +183,7 @@ class TrustCenterJob(Job):
             s.flush()
         for claim in new_claims:
             assurance.from_claim(s, claim, source_ref=target.url)
+            backup_from_claim(s, claim, source_ref=target.url)  # issue 2.1
         s.flush()
         if new_target or added:
             return "inserted"

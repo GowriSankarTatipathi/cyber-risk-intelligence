@@ -14,10 +14,12 @@ from .ingestion import DataVersion, IngestionCursor, IngestionError, IngestionRu
 from .quality import ValidationFinding, ValidationRun
 from .controls import CollectionTarget, PageFetch, SecurityControlClaim
 from .assurance import SecurityAssurance
+from .backup import BackupPolicyClaim
 from .email_security import DnsSecurityRecord, EmailSecurityObservation
 from .evidence import EvidenceLink, EvidenceObject, EvidenceVersion, Source
 
 __all__ = [
+    "BackupPolicyClaim",
     "DnsSecurityRecord",
     "EmailSecurityObservation",
     "SecurityAssurance",

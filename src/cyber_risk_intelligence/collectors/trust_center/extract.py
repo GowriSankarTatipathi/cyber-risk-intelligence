@@ -42,7 +42,7 @@ _P = {
     "incident_response": re.compile(
         r"incident response|security incidents?|breach notification|notify (?:affected )?customers", I),
     "backup_and_recovery": re.compile(
-        r"\bbackups?\b|backed up|disaster recovery|business continuity|recovery (?:point|time) objective|\bRPO\b|\bRTO\b", I),
+        r"\bbackups?\b|\bback(?:ed|ing|s)? up\b|\bsnapshots?\b|\breplicat(?:e|ed|es|ion|ing)\b|disaster recovery|business continuity|recovery (?:point|time) objective|\bRPO\b|\bRTO\b", I),
     "logging_and_monitoring": re.compile(
         r"audit logs?|security logging|\bSIEM\b|24\s*/\s*7|24x7|security operations cent(?:er|re)|intrusion (?:detection|prevention)|continuous(?:ly)? monitor", I),
     "security_training": re.compile(r"security (?:awareness )?training|phishing simulations?", I),
