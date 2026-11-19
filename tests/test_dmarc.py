@@ -70,24 +70,53 @@ def test_reporting_destinations_are_recorded_not_used():
 
 
 @pytest.mark.parametrize("record, problem", [
-    ("v=DMARC1; rua=mailto:r@acme.example", "required tag p is missing"),
+    ("v=DMARC1; sp=quarantine", "required tag p is missing"),
     ("v=DMARC1; p=block", "p=block"),
+    ("p=reject; v=DMARC1", "does not start with v=DMARC1"),
+    ("v=DMARC1 p=reject", "does not start with v=DMARC1"),  # missing semicolon after the version
+])
+def test_records_receivers_discard_are_invalid(record, problem):
+    rec = parse_dmarc(record)
+    assert not rec.valid and any(problem in p for p in rec.problems)
+
+
+@pytest.mark.parametrize("record, problem", [
     ("v=DMARC1; p=reject; adkim=x", "adkim=x"),
     ("v=DMARC1; p=reject; pct=150", "pct=150"),
     ("v=DMARC1; p=reject; rua=dmarc@acme.example", "not a mailto"),
     ("v=DMARC1; p=reject; p=none", "more than once"),
     ("v=DMARC1; p=reject; garbage", "malformed tag"),
-    ("p=reject; v=DMARC1", "does not start with v=DMARC1"),
+    ("v=DMARC1; p=reject; sp=maybe", "sp=maybe"),
 ])
-def test_malformed_tags_make_the_record_invalid(record, problem):
+def test_other_malformed_tags_are_flagged_but_the_policy_stands(record, problem):
     rec = parse_dmarc(record)
-    assert not rec.valid and any(problem in p for p in rec.problems)
+    assert rec.valid and rec.policy == "reject" and rec.pct == 100
+    assert any(problem in p and "ignored by receivers" in p for p in rec.problems)
+    assert read_dmarc([[record]]).status == "present"
+
+
+def test_missing_semicolon_between_report_tags():
+    # Seen in the wild: rua and ruf run together, so both addresses are unusable but p=none still applies.
+    rec = parse_dmarc("v=DMARC1; p=none; pct=100; rua=mailto:d@acme.example ruf=mailto:d@acme.example")
+    assert rec.valid and rec.policy == "none" and rec.aggregate_reports == []
+    assert any("missing ';'" in p for p in rec.problems)
+
+
+def test_bad_p_with_valid_rua_is_read_as_none():
+    rec = parse_dmarc("v=DMARC1; p=block; rua=mailto:r@acme.example")
+    assert rec.valid and rec.policy == "none" and rec.subdomain_policy == "none"
+
+
+def test_ignored_values_take_their_defaults():
+    rec = parse_dmarc("v=DMARC1; p=reject; adkim=x; pct=abc; rua=mailto:r@acme.example")
+    assert (rec.dkim_alignment, rec.pct) == ("relaxed", 100)
+    assert rec.defaults_used == ["sp", "adkim", "aspf", "pct"]
 
 
 def test_valid_records_with_weak_points_are_noted():
-    assert "no rua" in parse_dmarc("v=DMARC1; p=none").problems[0]
+    assert "no usable rua" in parse_dmarc("v=DMARC1; p=none").problems[0]
     assert any("pct=25" in p for p in parse_dmarc("v=DMARC1; p=reject; pct=25; rua=mailto:r@x.example").problems)
-    assert "unknown tag zz" in parse_dmarc("v=DMARC1; p=none; rua=mailto:r@x.example; zz=1").problems[0]
+    assert "unknown tag zz (ignored by receivers)" in parse_dmarc("v=DMARC1; p=none; rua=mailto:r@x.example; zz=1").problems
 
 
 def test_finding_the_record():
@@ -122,7 +151,7 @@ def test_dmarc_lookup_is_stored_with_raw_answer_and_evidence(session_factory, st
     (TxtLookup("nxdomain", "fake-resolver", rcode="NXDOMAIN"), "missing"),  # no _dmarc name is "missing", not "no domain"
     (TxtLookup("no_records", "fake-resolver", rcode="NOERROR"), "missing"),
     ([["v=DMARC1; p=none"], ["v=DMARC1; p=reject"]], "multiple"),
-    ([["v=DMARC1; p=maybe"]], "invalid"),
+    ([["v=DMARC1; p=maybe"]], "invalid"),  # no usable p and no rua to fall back on
 ])
 def test_each_outcome_is_recorded_distinctly(session_factory, store, acme, answer, status):
     collect(session_factory, store, {"_dmarc.acme.example": answer})
