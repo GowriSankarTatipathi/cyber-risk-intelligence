@@ -49,9 +49,9 @@ def summary(sf) -> None:
             "v.latest_valid_until, v.company_claims, v.company_documents, v.register_entries "
             "FROM company_assurance_summary v JOIN companies c ON c.id = v.company_id "
             "ORDER BY c.company_key, v.framework")).all()
-    print(f"{'company':28} {'framework':16} {'type':8} {'status':16} {'validity':9} claims docs registers")
+    print(f"{'company':28} {'framework':22} {'type':8} {'status':16} {'validity':9} claims docs registers")
     for r in rows:
-        print(f"{r.company_key:28} {r.framework:16} {r.rt:8} {r.status:16} {r.validity:9} "
+        print(f"{r.company_key:28} {r.framework:22} {r.rt:8} {r.status:16} {r.validity:9} "
               f"{r.company_claims:6} {r.company_documents:4} {r.register_entries:9}")
     print(f"{len(rows)} company/framework pairs")
 
