@@ -9,7 +9,15 @@ from ..evidence import store_from_env
 from .framework import IngestionFailed, retry_import, run_import
 from .seed_companies import SeedCompaniesJob
 
-JOBS = {"seed-companies": SeedCompaniesJob}
+
+def _trust_center(store):
+    from ..collectors.trust_center import TrustCenterJob
+
+    return TrustCenterJob(store)
+
+
+# Each entry builds the job; collectors need the evidence store to save pages.
+JOBS = {"seed-companies": lambda store: SeedCompaniesJob(), "trust-center": _trust_center}
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -26,7 +34,7 @@ def main(argv: list[str] | None = None) -> int:
 
     sf = make_session_factory(make_engine())
     store = store_from_env()
-    job = JOBS[args.job]()
+    job = JOBS[args.job](store)
     try:
         if args.command == "run":
             url = args.source_url or args.path.resolve().as_uri()

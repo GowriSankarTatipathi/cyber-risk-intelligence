@@ -12,9 +12,13 @@ from .company import (
 )
 from .ingestion import DataVersion, IngestionCursor, IngestionError, IngestionRun, ValidationResult
 from .quality import ValidationFinding, ValidationRun
+from .controls import CollectionTarget, PageFetch, SecurityControlClaim
 from .evidence import EvidenceLink, EvidenceObject, EvidenceVersion, Source
 
 __all__ = [
+    "SecurityControlClaim",
+    "PageFetch",
+    "CollectionTarget",
     "ValidationRun",
     "ValidationFinding",
     "ValidationResult",

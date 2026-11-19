@@ -1,0 +1,5 @@
+company_key,url,page_type,notes
+microsoft,https://www.microsoft.com/en-us/trust-center,trust_center,example: check the URL is current before use
+alphabet,https://cloud.google.com/security,security,example: check the URL is current before use
+amazon,https://aws.amazon.com/compliance/,compliance,example: check the URL is current before use
+adobe,https://www.adobe.com/trust.html,trust_center,example: check the URL is current before use
