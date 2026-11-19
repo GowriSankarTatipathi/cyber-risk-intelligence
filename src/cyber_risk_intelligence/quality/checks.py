@@ -214,6 +214,23 @@ CHECKS: tuple[Check, ...] = (
                              AND r.status IN ('succeeded', 'partial') AND r.started_at > f.started_at)""",
     ),
     Check(
+        "spf_lookup_failed", "warning",
+        "The latest SPF lookup for a company domain failed (timeout, SERVFAIL ...). Run it again; "
+        "a failed lookup says nothing about whether the domain publishes SPF.",
+        "SELECT count(*) FROM latest_spf_observations",
+        """SELECT 'domains', o.domain_id, d.name || ' last SPF lookup failed: ' || coalesce(o.problems->>0, '')
+           FROM latest_spf_observations o JOIN domains d ON d.id = o.domain_id WHERE o.status = 'lookup_failed'""",
+    ),
+    Check(
+        "company_domain_without_spf_lookup", "info",
+        "A current company domain has never had its SPF looked up, so its SPF is unknown.",
+        "SELECT count(*) FROM company_domains WHERE valid_to IS NULL",
+        """SELECT 'company_domains', cd.id, d.name || ' has no SPF lookup yet'
+           FROM company_domains cd JOIN domains d ON d.id = cd.domain_id
+           WHERE cd.valid_to IS NULL AND NOT EXISTS (
+             SELECT 1 FROM email_security_observations o WHERE o.domain_id = cd.domain_id AND o.control = 'spf')""",
+    ),
+    Check(
         "assurance_verified_from_company_source", "error",
         "A certification is marked verified but its evidence comes from the company's own website. "
         "Only an independent register can verify one.",
