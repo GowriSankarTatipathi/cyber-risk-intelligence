@@ -17,8 +17,8 @@ dist/
 *.key
 
 # Collected evidence and local databases
-data/
-evidence/
+/data/
+/evidence/
 *.sqlite
 *.sqlite3
 *.db

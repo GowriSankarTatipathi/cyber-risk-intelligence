@@ -17,10 +17,12 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8"]
+minio = ["minio>=7.2"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["src"]
 addopts = "-ra"
