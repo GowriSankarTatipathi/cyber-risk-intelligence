@@ -17,6 +17,7 @@ from urllib.parse import urlsplit
 
 from sqlalchemy import func, select
 
+from ... import assurance
 from ...evidence import SecretDetected, find_secrets, read_evidence, record_evidence
 from ...evidence.store import ObjectStore, sha256_hex
 from ...ingest.framework import InputRow, Job, RowRejected, RowStatus, Rule, SourceSpec, WriteContext, ensure_source
@@ -154,6 +155,7 @@ class TrustCenterJob(Job):
         s.add(fetch)
 
         added = 0
+        new_claims: list[SecurityControlClaim] = []
         if page is not None:
             for c in page.claims:
                 exists = s.scalar(select(SecurityControlClaim.id).where(
@@ -162,14 +164,24 @@ class TrustCenterJob(Job):
                     SecurityControlClaim.qualifier.is_not_distinct_from(c.qualifier),
                     SecurityControlClaim.claim_hash == c.claim_hash))
                 if exists is None:
-                    s.add(SecurityControlClaim(
+                    claim = SecurityControlClaim(
                         company_id=company.id, evidence_version_id=version.id, control_category=c.category,
                         assertion=c.assertion, qualifier=c.qualifier, claim_text=c.claim_text,
                         context_text=c.context_text, section_heading=c.section_heading, claim_hash=c.claim_hash,
                         page_updated_on=page.updated_on, source_ref=target.url, verification_status="claimed",
-                        observed_at=version.collected_at))
+                        observed_at=version.collected_at)
+                    s.add(claim)
+                    new_claims.append(claim)
                     added += 1
             fetch.claims_found = len(page.claims)
+        s.flush()
+        # Issue 1.3: certifications the company publishes the certificate/report for, or claims.
+        # Documents first, so a certificate's own wording isn't also counted as a separate claim.
+        if kind not in (None, "html") and result.outcome == "captured":
+            assurance.from_document(s, company.id, version, document_text(content, kind), source_ref=target.url)
+            s.flush()
+        for claim in new_claims:
+            assurance.from_claim(s, claim, source_ref=target.url)
         s.flush()
         if new_target or added:
             return "inserted"

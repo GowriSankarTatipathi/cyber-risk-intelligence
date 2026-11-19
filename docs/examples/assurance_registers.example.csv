@@ -1,0 +1,3 @@
+company_key,directory,record_url,framework,report_type,level,issuer,accreditation_body,certificate_number,scope,issued_on,valid_from,valid_until,status,holder_name
+examplecorp,IAF CertSearch,https://www.iafcertsearch.org/certification/EXAMPLE-ID,ISO/IEC 27001,,,BSI,UKAS,IS 000000,Provision of cloud software services,2024-03-01,2024-03-01,2027-02-28,active,Example Corp Inc.
+examplecorp,FedRAMP Marketplace,https://marketplace.fedramp.gov/products/EXAMPLE-ID,FedRAMP,,Moderate,,,,Example Cloud Platform,,,,active,Example Corp Inc.

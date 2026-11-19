@@ -16,8 +16,15 @@ def _trust_center(store):
     return TrustCenterJob(store)
 
 
+def _assurance_directory(store):
+    from ..assurance.directory import AssuranceDirectoryJob
+
+    return AssuranceDirectoryJob()
+
+
 # Each entry builds the job; collectors need the evidence store to save pages.
-JOBS = {"seed-companies": lambda store: SeedCompaniesJob(), "trust-center": _trust_center}
+JOBS = {"seed-companies": lambda store: SeedCompaniesJob(), "trust-center": _trust_center,
+        "assurance-directory": _assurance_directory}
 
 
 def main(argv: list[str] | None = None) -> int:
