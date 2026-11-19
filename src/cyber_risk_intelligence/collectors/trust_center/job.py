@@ -29,9 +29,8 @@ from ...models import (
     SecurityControlClaim,
 )
 from ...models.controls import PAGE_TYPES
-from .extract import extract
 from .fetch import Fetcher, HttpFetcher
-from .pdf import is_pdf, pdf_pages
+from .documents import detect_kind, document_text, extract_document
 from .scrub import scrub_html
 
 PAGES_SOURCE = SourceSpec(
@@ -103,16 +102,18 @@ class TrustCenterJob(Job):
             return "inserted" if new_target else "updated"
 
         content = result.content
-        if result.outcome == "captured" and is_pdf(content):
-            # PDF text is compressed, so check what the document actually says, not its raw bytes.
-            kinds = _pdf_secrets(content)
+        kind = detect_kind(content, result.content_type, result.final_url or target.url) \
+            if result.outcome == "captured" else None
+        if kind not in (None, "html"):
+            # Documents (some compressed) are checked on what they actually say, not their raw bytes.
+            kinds = find_secrets(document_text(content, kind).encode("utf-8", "ignore"))
             if kinds:
                 fetch.outcome = "withheld"
                 fetch.message = f"Evidence rejected: looks like it contains secrets ({', '.join(kinds)})"
                 s.add(fetch)
                 s.flush()
                 return "inserted" if new_target else "updated"
-        elif result.outcome == "captured" and find_secrets(content):
+        elif kind == "html" and find_secrets(content):
             # Usually a browser key embedded in the page's code; keep the page, drop the code.
             content, removed = scrub_html(content)
             fetch.message = f"stored without page scripts and {removed} code item(s) that looked like keys"
@@ -123,7 +124,7 @@ class TrustCenterJob(Job):
             select(EvidenceVersion.id).join(EvidenceObject).where(
                 EvidenceVersion.source_id == source.id, EvidenceVersion.source_url == target.url,
                 EvidenceObject.sha256 == digest))
-        page = extract(content) if result.outcome == "captured" else None
+        page = extract_document(content, kind) if kind else None
         try:
             version = record_evidence(
                 s, self.store, source=source, source_url=target.url, content=content,
@@ -161,10 +162,3 @@ class TrustCenterJob(Job):
             return "inserted"
         return "unchanged" if fetch.outcome == "not_modified" else "updated"
 
-
-def _pdf_secrets(content: bytes) -> list[str]:
-    try:
-        text = "\n".join(pdf_pages(content))
-    except Exception:
-        return []
-    return find_secrets(text.encode("utf-8", "ignore"))

@@ -184,8 +184,14 @@ def _negated(sentence: str, start: int) -> bool:
     return bool(_NEGATION.search(sentence[max(0, start - 60):start]))
 
 
+_URL = re.compile(r"\b(?:https?|ftp)://\S+|\bwww\.\S+", I)
+
+
 def _claims_in_sentence(sentence: str, context: str, heading: str | None) -> list[ExtractedClaim]:
     out: list[ExtractedClaim] = []
+    claim_sentence = sentence
+    # Match on the words, not on links: "https://..." is not a claim about HTTPS.
+    sentence = _URL.sub(lambda m: " " * len(m.group(0)), sentence)
     for category, pattern in _P.items():
         m = pattern.search(sentence)
         if not m:
@@ -196,7 +202,7 @@ def _claims_in_sentence(sentence: str, context: str, heading: str | None) -> lis
         if qm:
             qualifier = f"AES-{qm.group(1)}" if category == "encryption_at_rest" else f"TLS {qm.group(1)}"
         out.append(ExtractedClaim(category, "negated" if _negated(sentence, m.start()) else "affirmed",
-                                  qualifier, sentence, context, heading))
+                                  qualifier, claim_sentence, context, heading))
     seen: set[str] = set()
     for name, rx in _FRAMEWORK_RE:
         m = rx.search(sentence)
@@ -208,8 +214,24 @@ def _claims_in_sentence(sentence: str, context: str, heading: str | None) -> lis
         seen.add(family)
         out.append(ExtractedClaim("compliance_certification",
                                   "negated" if _negated(sentence, m.start()) else "affirmed",
-                                  name, sentence, context, heading))
+                                  name, claim_sentence, context, heading))
     return out
+
+
+def add_claims_from_sections(page: PageExtract, sections: list[tuple[str | None, str]]) -> None:
+    """Add claims from plain-text sections: (heading, text). Context is the sentence and its neighbours."""
+    seen = {(c.category, c.qualifier, c.claim_hash) for c in page.claims}
+    for heading, text in sections:
+        sentences = [x.strip() for x in _SENTENCE_SPLIT.split(_squash(text)) if x.strip()]
+        for i, sentence in enumerate(sentences):
+            if len(sentence) < 12 or len(sentence) > 1000:
+                continue
+            context = " ".join(sentences[max(0, i - 1): i + 2])
+            for claim in _claims_in_sentence(sentence, context, heading):
+                key = (claim.category, claim.qualifier, claim.claim_hash)
+                if key not in seen:
+                    seen.add(key)
+                    page.claims.append(claim)
 
 
 def extract(html: bytes | str) -> PageExtract:

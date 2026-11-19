@@ -17,7 +17,7 @@ from datetime import UTC, datetime
 
 from pypdf import PdfReader
 
-from .extract import _SENTENCE_SPLIT, _UPDATED, PageExtract, _claims_in_sentence, _parse_date, _squash
+from .extract import _UPDATED, PageExtract, _parse_date, _squash, add_claims_from_sections
 
 MAX_PAGES = 400
 
@@ -85,16 +85,6 @@ def extract_pdf(content: bytes) -> PageExtract:
     if not page.updated_on and (m := _UPDATED.search(_squash(full))):
         page.updated_on = _parse_date(m.group(1))
 
-    seen: set[tuple[str, str | None, str]] = set()
-    for number, text in enumerate(pages, start=1):
-        sentences = [s.strip() for chunk in _chunks(text) for s in _SENTENCE_SPLIT.split(chunk) if s.strip()]
-        for i, sentence in enumerate(sentences):
-            if len(sentence) < 12 or len(sentence) > 1000:
-                continue
-            context = " ".join(sentences[max(0, i - 1): i + 2])
-            for claim in _claims_in_sentence(sentence, context, f"page {number}"):
-                key = (claim.category, claim.qualifier, claim.claim_hash)
-                if key not in seen:
-                    seen.add(key)
-                    page.claims.append(claim)
+    add_claims_from_sections(page, [(f"page {n}", chunk) for n, text in enumerate(pages, start=1)
+                                    for chunk in _chunks(text)])
     return page
