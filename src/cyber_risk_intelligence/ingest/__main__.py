@@ -22,9 +22,21 @@ def _assurance_directory(store):
     return AssuranceDirectoryJob()
 
 
+def _company_domains(store):
+    from ..domains import CompanyDomainsJob
+
+    return CompanyDomainsJob()
+
+
+def _spf(store):
+    from ..email_security import SpfJob
+
+    return SpfJob(store)
+
+
 # Each entry builds the job; collectors need the evidence store to save pages.
 JOBS = {"seed-companies": lambda store: SeedCompaniesJob(), "trust-center": _trust_center,
-        "assurance-directory": _assurance_directory}
+        "assurance-directory": _assurance_directory, "company-domains": _company_domains, "spf": _spf}
 
 
 def main(argv: list[str] | None = None) -> int:
