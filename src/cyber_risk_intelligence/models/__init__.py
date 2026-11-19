@@ -10,6 +10,7 @@ from .company import (
     IndustryClassification,
     LegalEntity,
 )
+from .evidence import EvidenceLink, EvidenceObject, EvidenceVersion, Source
 
 __all__ = [
     "Base",
@@ -17,9 +18,13 @@ __all__ = [
     "CompanyAlias",
     "CompanyDomain",
     "Domain",
+    "EvidenceLink",
+    "EvidenceObject",
+    "EvidenceVersion",
     "EntityIdentifier",
     "EntityRelationship",
     "IndexMembership",
     "IndustryClassification",
     "LegalEntity",
+    "Source",
 ]

@@ -36,9 +36,9 @@ class IdMixin:
 class ProvenanceMixin:
     """Where a fact came from and when it was true.
 
-    ``source_ref`` holds a source URL or citation for now. Issue 17.7 adds an
-    ``evidence`` table; these tables will then gain an ``evidence_id`` foreign
-    key and ``source_ref`` stays as the human-readable citation.
+    ``source_ref`` is the human-readable citation. The stored original
+    documents behind a row are attached through ``evidence_links`` (issue 17.7),
+    which lets one record cite several captures and one capture back many records.
 
     NULL always means "not known", never "absent".
     """

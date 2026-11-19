@@ -22,5 +22,6 @@ The `cyber_app` role needs `CREATE` on the database (it owns it in the standard 
 
 * `src/cyber_risk_intelligence/models/`: SQLAlchemy models
 * `src/cyber_risk_intelligence/normalize.py`: identifier, name and domain normalization
+* `src/cyber_risk_intelligence/evidence/`: checksummed evidence storage (local folder or MinIO)
 * `migrations/`: Alembic migrations
-* `docs/schema/`: one page per schema issue ([17.1 company and legal entities](docs/schema/17.1-company-legal-entity.md))
+* `docs/schema/`: one page per schema issue ([17.1 company and legal entities](docs/schema/17.1-company-legal-entity.md), [17.7 evidence storage](docs/schema/17.7-evidence-storage.md))
