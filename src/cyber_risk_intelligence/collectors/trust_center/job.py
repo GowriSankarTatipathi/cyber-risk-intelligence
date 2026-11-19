@@ -17,7 +17,7 @@ from urllib.parse import urlsplit
 
 from sqlalchemy import select
 
-from ...evidence import SecretDetected, record_evidence
+from ...evidence import SecretDetected, find_secrets, record_evidence
 from ...evidence.store import ObjectStore, sha256_hex
 from ...ingest.framework import InputRow, Job, RowRejected, RowStatus, Rule, SourceSpec, WriteContext, ensure_source
 from ...models import (
@@ -31,6 +31,7 @@ from ...models import (
 from ...models.controls import PAGE_TYPES
 from .extract import extract
 from .fetch import Fetcher, HttpFetcher
+from .scrub import scrub_html
 
 PAGES_SOURCE = SourceSpec(
     source_key="company_trust_centers",
@@ -100,23 +101,29 @@ class TrustCenterJob(Job):
             s.flush()
             return "inserted" if new_target else "updated"
 
+        content = result.content
+        if result.outcome == "captured" and find_secrets(content):
+            # Usually a browser key embedded in the page's code; keep the page, drop the code.
+            content, removed = scrub_html(content)
+            fetch.message = f"stored without page scripts and {removed} code item(s) that looked like keys"
+
         source = ensure_source(s, PAGES_SOURCE)
-        digest = sha256_hex(result.content)
+        digest = sha256_hex(content)
         seen_before = s.scalar(
             select(EvidenceVersion.id).join(EvidenceObject).where(
                 EvidenceVersion.source_id == source.id, EvidenceVersion.source_url == target.url,
                 EvidenceObject.sha256 == digest))
-        page = extract(result.content) if result.outcome == "captured" else None
+        page = extract(content) if result.outcome == "captured" else None
         try:
             version = record_evidence(
-                s, self.store, source=source, source_url=target.url, content=result.content,
+                s, self.store, source=source, source_url=target.url, content=content,
                 media_type=result.content_type or "application/octet-stream", http_status=result.http_status,
                 title=page.title if page else None, published_at=page.published_at if page else None)
         except SecretDetected as exc:
             fetch.outcome, fetch.message = "withheld", str(exc)
             s.add(fetch)
             s.flush()
-            return "updated"
+            return "inserted" if new_target else "updated"
         fetch.evidence_version_id = version.id
         if seen_before and result.outcome == "captured":
             fetch.outcome = "not_modified"

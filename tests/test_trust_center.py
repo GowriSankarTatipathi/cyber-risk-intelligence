@@ -192,6 +192,23 @@ def test_page_with_a_credential_is_withheld(session_factory, store, acme):
     assert claims(session_factory) == []
 
 
+def test_keys_in_page_code_are_scrubbed_not_withheld(session_factory, store, acme):
+    # Public pages embed browser keys in scripts and widget attributes. Keep the page, drop the code.
+    noisy = FIXTURE.replace(b"</body>", (
+        b'<script>var cfg = {password: "widgetpass123", u: "https://bot:hunter2hunter@cdn.example/x"};</script>'
+        b'<div class="search" api-key="d068ed3ac1510812754af5c8b930c3cf"></div><!-- token=abcdefgh12345 --></body>'))
+    job = TrustCenterJob(store, FakeFetcher({URL: noisy}))
+    run_import(session_factory, store, job, targets(["acme", URL, "trust_center"]), source_url="file:///t.csv")
+    [fetch] = fetches(session_factory)
+    assert fetch.outcome == "captured" and fetch.evidence_version_id is not None
+    assert fetch.claims_found == len(EXPECTED) and "scripts" in fetch.message
+    with session_factory() as s:
+        stored = read_evidence(s, store, s.get(EvidenceVersion, fetch.evidence_version_id))
+    for gone in (b"widgetpass123", b"hunter2hunter", b"d068ed3ac1510812754af5c8b930c3cf", b"abcdefgh12345"):
+        assert gone not in stored
+    assert b"encrypted at rest using AES-256" in stored and b'class="search"' in stored
+
+
 def test_claims_can_never_be_marked_verified(session_factory, store, acme):
     job = TrustCenterJob(store, FakeFetcher({URL: FIXTURE}))
     run_import(session_factory, store, job, targets(["acme", URL, "trust_center"]), source_url="file:///t.csv")
