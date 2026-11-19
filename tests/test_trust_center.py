@@ -393,3 +393,29 @@ def test_office_file_with_a_credential_in_its_text_is_withheld(session_factory, 
                targets(["acme", url, "security"]), source_url="file:///t.csv")
     [fetch] = fetches(session_factory)
     assert fetch.outcome == "withheld" and claims(session_factory) == []
+
+
+def test_encrypted_pdf_is_read(tmp_path):
+    from pypdf import PdfReader, PdfWriter
+    w = PdfWriter(clone_from=PdfReader(io.BytesIO(POLICY_PDF)))
+    w.encrypt(user_password="", owner_password="owner-only", algorithm="AES-256")  # how many reports are published
+    buf = io.BytesIO()
+    w.write(buf)
+    page = extract(buf.getvalue())
+    assert {c.category for c in page.claims} >= {"encryption_at_rest", "mfa"}
+
+
+def test_unreadable_pdf_does_not_stop_the_run(session_factory, store, acme, monkeypatch):
+    from cyber_risk_intelligence.collectors.trust_center import documents, pdf
+
+    def boom(_content):
+        raise RuntimeError("cannot decrypt")
+
+    monkeypatch.setattr(documents, "pdf_pages", boom)
+    monkeypatch.setattr(pdf, "pdf_pages", boom)
+    doc = FetchResult("captured", PDF_URL, PDF_URL, 200, "application/pdf", POLICY_PDF)
+    run = run_import(session_factory, store, TrustCenterJob(store, FakeFetcher({PDF_URL: doc})),
+                     targets(["acme", PDF_URL, "security"]), source_url="file:///t.csv")
+    assert run.status == "succeeded"
+    [fetch] = fetches(session_factory)
+    assert fetch.outcome == "captured" and fetch.claims_found == 0  # stored, can be read again later

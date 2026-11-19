@@ -110,9 +110,9 @@ def extract_document(content: bytes, kind: str) -> PageExtract:
 
 def document_text(content: bytes, kind: str) -> str:
     """All readable text, used for the secret check on formats whose raw bytes are compressed."""
-    if kind == "pdf":
-        return "\n".join(pdf_pages(content))
     try:
+        if kind == "pdf":
+            return "\n".join(pdf_pages(content))
         return "\n".join(t for _, t in _read(content, kind)[3])
     except Exception:
         return ""
