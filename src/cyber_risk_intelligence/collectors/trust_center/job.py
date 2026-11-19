@@ -15,9 +15,9 @@ import csv
 import io
 from urllib.parse import urlsplit
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 
-from ...evidence import SecretDetected, find_secrets, record_evidence
+from ...evidence import SecretDetected, find_secrets, read_evidence, record_evidence
 from ...evidence.store import ObjectStore, sha256_hex
 from ...ingest.framework import InputRow, Job, RowRejected, RowStatus, Rule, SourceSpec, WriteContext, ensure_source
 from ...models import (
@@ -30,7 +30,7 @@ from ...models import (
 )
 from ...models.controls import PAGE_TYPES
 from .fetch import Fetcher, HttpFetcher
-from .documents import detect_kind, document_text, extract_document
+from .documents import detect_kind, document_text, extract_document, readable_text
 from .scrub import scrub_html
 
 PAGES_SOURCE = SourceSpec(
@@ -118,6 +118,19 @@ class TrustCenterJob(Job):
             content, removed = scrub_html(content)
             fetch.message = f"stored without page scripts and {removed} code item(s) that looked like keys"
 
+        if kind is not None:
+            fetch.text_sha256 = sha256_hex(readable_text(content, kind).encode("utf-8"))
+            previous = self._last_capture(s, target)
+            if previous is not None and self._text_sha256(s, previous) == fetch.text_sha256:
+                # Same words as last time; only hidden page code changed. Keep the earlier copy.
+                version = s.get(EvidenceVersion, previous.evidence_version_id)
+                version.last_seen_at = func.now()
+                fetch.outcome, fetch.evidence_version_id = "not_modified", version.id
+                fetch.claims_found = previous.claims_found
+                s.add(fetch)
+                s.flush()
+                return "inserted" if new_target else "unchanged"
+
         source = ensure_source(s, PAGES_SOURCE)
         digest = sha256_hex(content)
         seen_before = s.scalar(
@@ -162,3 +175,24 @@ class TrustCenterJob(Job):
             return "inserted"
         return "unchanged" if fetch.outcome == "not_modified" else "updated"
 
+    @staticmethod
+    def _last_capture(s, target: CollectionTarget) -> PageFetch | None:
+        return s.scalar(
+            select(PageFetch).where(PageFetch.target_id == target.id,
+                                    PageFetch.outcome.in_(("captured", "not_modified")),
+                                    PageFetch.evidence_version_id.is_not(None))
+            .order_by(PageFetch.id.desc()).limit(1))
+
+    def _text_sha256(self, s, fetch: PageFetch) -> str | None:
+        """The fingerprint of an earlier capture, computed from its stored copy if it predates fingerprints."""
+        if fetch.text_sha256 is None:
+            version = s.get(EvidenceVersion, fetch.evidence_version_id)
+            try:
+                content = read_evidence(s, self.store, version)
+            except Exception:
+                return None
+            kind = detect_kind(content, version.evidence_object.media_type, version.source_url)
+            if kind is None:
+                return None
+            fetch.text_sha256 = sha256_hex(readable_text(content, kind).encode("utf-8"))
+        return fetch.text_sha256
