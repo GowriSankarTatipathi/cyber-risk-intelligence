@@ -26,11 +26,18 @@ python -m cyber_risk_intelligence.ingest run seed-companies path/to/companies-20
 
 See [17.8](docs/schema/17.8-ingestion-and-data-quality.md) for retries and how to write new import jobs.
 
+Then check the data:
+
+```bash
+python -m cyber_risk_intelligence.quality --evidence
+```
+
 ## Layout
 
 * `src/cyber_risk_intelligence/models/`: SQLAlchemy models
 * `src/cyber_risk_intelligence/normalize.py`: identifier, name and domain normalization
 * `src/cyber_risk_intelligence/evidence/`: checksummed evidence storage (local folder or MinIO)
 * `src/cyber_risk_intelligence/ingest/`: repeatable import runs with validation, error records and retries
+* `src/cyber_risk_intelligence/quality/`: database-wide data-quality checks with recorded results
 * `migrations/`: Alembic migrations
-* `docs/schema/`: one page per schema issue ([17.1 company and legal entities](docs/schema/17.1-company-legal-entity.md), [17.7 evidence storage](docs/schema/17.7-evidence-storage.md), [17.8 ingestion](docs/schema/17.8-ingestion-and-data-quality.md))
+* `docs/schema/`: one page per schema issue ([17.1 company and legal entities](docs/schema/17.1-company-legal-entity.md), [17.7 evidence storage](docs/schema/17.7-evidence-storage.md), [17.8 ingestion](docs/schema/17.8-ingestion-and-data-quality.md), [27.7 data quality](docs/schema/27.7-data-quality-validation.md))
