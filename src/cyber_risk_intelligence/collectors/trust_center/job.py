@@ -31,6 +31,7 @@ from ...models import (
 from ...models.controls import PAGE_TYPES
 from .extract import extract
 from .fetch import Fetcher, HttpFetcher
+from .pdf import is_pdf, pdf_pages
 from .scrub import scrub_html
 
 PAGES_SOURCE = SourceSpec(
@@ -102,7 +103,16 @@ class TrustCenterJob(Job):
             return "inserted" if new_target else "updated"
 
         content = result.content
-        if result.outcome == "captured" and find_secrets(content):
+        if result.outcome == "captured" and is_pdf(content):
+            # PDF text is compressed, so check what the document actually says, not its raw bytes.
+            kinds = _pdf_secrets(content)
+            if kinds:
+                fetch.outcome = "withheld"
+                fetch.message = f"Evidence rejected: looks like it contains secrets ({', '.join(kinds)})"
+                s.add(fetch)
+                s.flush()
+                return "inserted" if new_target else "updated"
+        elif result.outcome == "captured" and find_secrets(content):
             # Usually a browser key embedded in the page's code; keep the page, drop the code.
             content, removed = scrub_html(content)
             fetch.message = f"stored without page scripts and {removed} code item(s) that looked like keys"
@@ -150,3 +160,11 @@ class TrustCenterJob(Job):
         if new_target or added:
             return "inserted"
         return "unchanged" if fetch.outcome == "not_modified" else "updated"
+
+
+def _pdf_secrets(content: bytes) -> list[str]:
+    try:
+        text = "\n".join(pdf_pages(content))
+    except Exception:
+        return []
+    return find_secrets(text.encode("utf-8", "ignore"))

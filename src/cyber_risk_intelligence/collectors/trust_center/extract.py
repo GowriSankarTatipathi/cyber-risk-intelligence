@@ -213,6 +213,11 @@ def _claims_in_sentence(sentence: str, context: str, heading: str | None) -> lis
 
 
 def extract(html: bytes | str) -> PageExtract:
+    """Claims in a web page, or in a PDF (detected by its ``%PDF-`` header)."""
+    if isinstance(html, bytes) and html.lstrip()[:5] == b"%PDF-":
+        from .pdf import extract_pdf
+
+        return extract_pdf(html)
     soup = BeautifulSoup(html, "html.parser")
     for junk in soup(["script", "style", "noscript", "template", "nav", "svg", "form"]):
         if junk.name == "script" and junk.get("type") == "application/ld+json":

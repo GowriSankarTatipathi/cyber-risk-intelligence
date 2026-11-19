@@ -38,7 +38,7 @@ FETCH_OUTCOMES = (
     "login_required",     # behind sign-in or NDA: not public
     "blocked_by_robots",  # robots.txt disallows us: not collected
     "rate_limited",       # 429: try again later
-    "not_html",           # PDF or other type this collector doesn't parse yet (stored if fetched)
+    "not_html",           # a file type this collector doesn't parse (stored if fetched); PDFs are captured
     "withheld",           # content looked like it contained a credential, so it was not stored
 )
 CONTROL_CATEGORIES = (
