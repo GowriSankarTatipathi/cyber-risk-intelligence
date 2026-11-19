@@ -1,12 +1,12 @@
-"""Collect SPF records for company domains (issue 23.1).
+"""Collect SPF (issue 23.1) and DMARC (issue 23.2) records for company domains.
 
 Input is a CSV ``company_key,domain`` (``python -m cyber_risk_intelligence.email_security targets``
-writes one from ``company_domains``). For each row the job asks a public resolver for the
-domain's TXT records, stores the answer as evidence, records the lookup in
-``dns_security_records`` and what it shows about SPF in ``email_security_observations``.
+writes one from ``company_domains``). For each row the job asks a public resolver for TXT
+records (``<domain>`` for SPF, ``_dmarc.<domain>`` for DMARC), stores each answer as evidence,
+records each lookup in ``dns_security_records`` and what it shows in ``email_security_observations``.
 
-Only TXT queries are made. No mail is sent and nothing on the company's servers is contacted
-directly. A failed lookup is ``lookup_failed``: it is never read as "no SPF".
+Only TXT queries are made. No mail or report is sent and nothing on the company's servers is
+contacted directly. A failed lookup is ``lookup_failed``: it is never read as "no record".
 """
 
 from __future__ import annotations
@@ -32,6 +32,7 @@ from ..ingest.framework import (
 )
 from ..models import Company, CompanyDomain, Domain
 from ..models.email_security import DnsSecurityRecord, EmailSecurityObservation
+from .dmarc import organizational_domain, read_dmarc
 from .dns import DnsResolver, Resolver
 from .spf import read_spf
 
@@ -52,10 +53,11 @@ def answer_document(query_name: str, record_type: str, outcome: str, rcode: str 
                        "answers": sorted(answers or [])}, indent=1, ensure_ascii=False).encode()
 
 
-class SpfJob(Job):
-    name = "spf"
-    dataset_key = "spf_targets"
+class _TxtJob(Job):
+    """Shared by the SPF and DMARC jobs: target parsing, the company/domain checks and one TXT lookup."""
+
     media_type = "text/csv"
+    control = ""
     source = SourceSpec(
         source_key="project_domain_targets",
         name="Project domain target list",
@@ -87,7 +89,7 @@ class SpfJob(Job):
             data = {k.strip(): (v or "").strip() for k, v in raw.items() if k}
             yield InputRow(number, f"{data.get('company_key')}|{normalize_domain(data.get('domain', ''))}", data)
 
-    def write(self, ctx: WriteContext) -> RowStatus:
+    def _target(self, ctx: WriteContext) -> tuple[Company, Domain]:
         s, r = ctx.session, ctx.row.data
         company = s.scalar(select(Company).where(Company.company_key == r["company_key"]))
         if company is None:
@@ -98,40 +100,61 @@ class SpfJob(Job):
         if domain is None:
             raise RowRejected("domain_not_linked", f"{name} is not a known domain of {r['company_key']}; "
                                                    "import it with company-domains first", "domain")
+        return company, domain
 
-        lookup = self.resolver.txt(name)
-        dns_row = DnsSecurityRecord(
-            domain_id=domain.id, query_name=name, record_type="TXT", resolver=lookup.resolver,
+    def _lookup(self, ctx: WriteContext, domain: Domain, query_name: str) -> tuple[DnsSecurityRecord, bool]:
+        """Query TXT at ``query_name``; store the answer. Returns the lookup row and whether the
+        answer is the same as the previous lookup of that name (the stored copy was reused)."""
+        s = ctx.session
+        lookup = self.resolver.txt(query_name)
+        row = DnsSecurityRecord(
+            domain_id=domain.id, query_name=query_name, record_type="TXT", resolver=lookup.resolver,
             outcome=lookup.outcome, rcode=lookup.rcode, message=lookup.message,
             answers=lookup.answers if lookup.outcome == "answered" else None, ttl=lookup.ttl,
             ingestion_run_id=ctx.run.id)
-        version = None
+        previous = s.scalar(select(DnsSecurityRecord.evidence_version_id).where(
+            DnsSecurityRecord.query_name == query_name, DnsSecurityRecord.record_type == "TXT")
+            .order_by(DnsSecurityRecord.id.desc()).limit(1))
         if lookup.outcome != "lookup_failed":
             try:
                 version = record_evidence(
-                    s, self.store, source=ensure_source(s, DNS_SOURCE), source_url=f"dns:{name}/TXT",
-                    content=answer_document(name, "TXT", lookup.outcome, lookup.rcode, lookup.answers),
-                    media_type="application/json", title=f"TXT records for {name}")
+                    s, self.store, source=ensure_source(s, DNS_SOURCE), source_url=f"dns:{query_name}/TXT",
+                    content=answer_document(query_name, "TXT", lookup.outcome, lookup.rcode, lookup.answers),
+                    media_type="application/json", title=f"TXT records for {query_name}")
             except SecretDetected as exc:
-                raise RowRejected("withheld", f"TXT answer for {name} not stored: {exc}", "domain") from None
-            dns_row.evidence_version_id = version.id
-        previous = s.scalar(select(DnsSecurityRecord.evidence_version_id).where(
-            DnsSecurityRecord.domain_id == domain.id, DnsSecurityRecord.record_type == "TXT")
-            .order_by(DnsSecurityRecord.id.desc()).limit(1))
-        s.add(dns_row)
+                raise RowRejected("withheld", f"TXT answer for {query_name} not stored: {exc}", "domain") from None
+            row.evidence_version_id = version.id
+        s.add(row)
         s.flush()
+        return row, row.evidence_version_id is not None and previous == row.evidence_version_id
 
-        obs = EmailSecurityObservation(
-            company_id=company.id, domain_id=domain.id, dns_record_id=dns_row.id, control="spf",
-            observed_at=dns_row.queried_at, evidence_version_id=version.id if version else None,
-            source_ref=f"dns:{name}/TXT via {lookup.resolver}")
-        if lookup.outcome == "lookup_failed":
-            obs.status = "lookup_failed"
-            obs.problems = [lookup.message or lookup.rcode or "lookup failed"]
-        elif lookup.outcome == "nxdomain":
+    def _observation(self, company: Company, domain: Domain, row: DnsSecurityRecord) -> EmailSecurityObservation:
+        return EmailSecurityObservation(
+            company_id=company.id, domain_id=domain.id, dns_record_id=row.id, control=self.control,
+            observed_at=row.queried_at, evidence_version_id=row.evidence_version_id,
+            source_ref=f"dns:{row.query_name}/TXT via {row.resolver}")
+
+
+def _failed(obs: EmailSecurityObservation, row: DnsSecurityRecord) -> None:
+    obs.status, obs.evidence_version_id = "lookup_failed", None
+    obs.problems = [row.message or row.rcode or "lookup failed"]
+
+
+class SpfJob(_TxtJob):
+    name = "spf"
+    dataset_key = "spf_targets"
+    control = "spf"
+
+    def write(self, ctx: WriteContext) -> RowStatus:
+        company, domain = self._target(ctx)
+        row, same = self._lookup(ctx, domain, domain.name)
+        obs = self._observation(company, domain, row)
+        if row.outcome == "lookup_failed":
+            _failed(obs, row)
+        elif row.outcome == "nxdomain":
             obs.status = "no_domain"
         else:
-            spf = read_spf(lookup.answers or [])
+            spf = read_spf(row.answers or [])
             obs.status = spf.status
             obs.record_count = len(spf.records)
             obs.record_text = "\n".join(spf.records) or None
@@ -142,10 +165,63 @@ class SpfJob(Job):
                 obs.all_qualifier, obs.redirect = rec.all_qualifier, rec.redirect
                 obs.mechanisms, obs.modifiers = rec.mechanisms, rec.modifiers
                 obs.dns_lookup_terms, obs.problems = rec.dns_lookup_terms, rec.problems or None
-        s.add(obs)
-        s.flush()
+        ctx.session.add(obs)
+        ctx.session.flush()
         # Every lookup is kept (it is an observation at a time); the answer itself is stored once.
-        return "unchanged" if version is not None and previous == version.id else "inserted"
+        return "unchanged" if same else "inserted"
+
+
+class DmarcJob(_TxtJob):
+    """DMARC is looked up at ``_dmarc.<domain>``. When a subdomain (``corporate.acme.com``) has none,
+    receivers use the organizational domain's record (``_dmarc.acme.com``), so we look there too and
+    record which one applies (``policy_source``)."""
+
+    name = "dmarc"
+    dataset_key = "dmarc_targets"
+    control = "dmarc"
+
+    def write(self, ctx: WriteContext) -> RowStatus:
+        company, domain = self._target(ctx)
+        row, same = self._lookup(ctx, domain, f"_dmarc.{domain.name}")
+        obs = self._observation(company, domain, row)
+        if row.outcome == "lookup_failed":
+            _failed(obs, row)
+        else:
+            result, policy_row = read_dmarc(row.answers or []), row
+            org = organizational_domain(domain.name)
+            if result.status == "missing" and org != domain.name:
+                policy_row, same_org = self._lookup(ctx, domain, f"_dmarc.{org}")
+                same = same and same_org
+                if policy_row.outcome == "lookup_failed":
+                    _failed(obs, policy_row)
+                    obs.policy_dns_record_id = policy_row.id
+                    ctx.session.add(obs)
+                    ctx.session.flush()
+                    return "unchanged" if same else "inserted"
+                result = read_dmarc(policy_row.answers or [])
+                obs.policy_dns_record_id = policy_row.id
+                obs.evidence_version_id = policy_row.evidence_version_id if result.status != "missing" \
+                    else row.evidence_version_id
+            obs.status = result.status
+            obs.record_count = len(result.records)
+            obs.record_text = "\n".join(result.records) or None
+            if result.status != "missing":
+                obs.policy_source = "domain" if policy_row is row else "organizational_domain"
+            if result.status == "multiple":
+                obs.problems = [f"{len(result.records)} DMARC records published; receivers ignore them all"]
+            if result.record is not None:
+                rec = result.record
+                obs.tags, obs.problems = rec.tags, rec.problems or None
+                if result.status == "present":
+                    obs.dmarc_policy, obs.dmarc_subdomain_policy = rec.policy, rec.subdomain_policy
+                    obs.dmarc_pct = rec.pct
+                    obs.dkim_alignment, obs.spf_alignment = rec.dkim_alignment, rec.spf_alignment
+                    obs.aggregate_report_uris = rec.aggregate_reports or None
+                    obs.failure_report_uris = rec.failure_reports or None
+                    obs.defaults_used = rec.defaults_used or None
+        ctx.session.add(obs)
+        ctx.session.flush()
+        return "unchanged" if same else "inserted"
 
 
 def targets_csv(s) -> bytes:

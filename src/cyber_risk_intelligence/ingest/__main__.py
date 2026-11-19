@@ -34,9 +34,16 @@ def _spf(store):
     return SpfJob(store)
 
 
+def _dmarc(store):
+    from ..email_security import DmarcJob
+
+    return DmarcJob(store)
+
+
 # Each entry builds the job; collectors need the evidence store to save pages.
 JOBS = {"seed-companies": lambda store: SeedCompaniesJob(), "trust-center": _trust_center,
-        "assurance-directory": _assurance_directory, "company-domains": _company_domains, "spf": _spf}
+        "assurance-directory": _assurance_directory, "company-domains": _company_domains, "spf": _spf,
+        "dmarc": _dmarc}
 
 
 def main(argv: list[str] | None = None) -> int:

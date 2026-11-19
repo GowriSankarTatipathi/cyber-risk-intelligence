@@ -231,6 +231,23 @@ CHECKS: tuple[Check, ...] = (
              SELECT 1 FROM email_security_observations o WHERE o.domain_id = cd.domain_id AND o.control = 'spf')""",
     ),
     Check(
+        "dmarc_lookup_failed", "warning",
+        "The latest DMARC lookup for a company domain failed. Run it again; "
+        "a failed lookup says nothing about whether the domain publishes DMARC.",
+        "SELECT count(*) FROM latest_dmarc_observations",
+        """SELECT 'domains', o.domain_id, d.name || ' last DMARC lookup failed: ' || coalesce(o.problems->>0, '')
+           FROM latest_dmarc_observations o JOIN domains d ON d.id = o.domain_id WHERE o.status = 'lookup_failed'""",
+    ),
+    Check(
+        "company_domain_without_dmarc_lookup", "info",
+        "A current company domain has never had its DMARC looked up, so its DMARC is unknown.",
+        "SELECT count(*) FROM company_domains WHERE valid_to IS NULL",
+        """SELECT 'company_domains', cd.id, d.name || ' has no DMARC lookup yet'
+           FROM company_domains cd JOIN domains d ON d.id = cd.domain_id
+           WHERE cd.valid_to IS NULL AND NOT EXISTS (
+             SELECT 1 FROM email_security_observations o WHERE o.domain_id = cd.domain_id AND o.control = 'dmarc')""",
+    ),
+    Check(
         "assurance_verified_from_company_source", "error",
         "A certification is marked verified but its evidence comes from the company's own website. "
         "Only an independent register can verify one.",

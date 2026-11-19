@@ -251,7 +251,7 @@ def test_wikidata_domain_list_keeps_parent_domains_and_reports_gaps():
 
     from cyber_risk_intelligence.domains.wikidata import build
 
-    seed = ("Company name,Current issuer CIK\nAcme Corp,0000000001\nGlobex,0000000002\n").encode()
+    seed = (b"Company name,Current issuer CIK\nAcme Corp,0000000001\nGlobex,0000000002\n")
 
     def handler(request):
         assert request.url.host == "query.wikidata.org"
