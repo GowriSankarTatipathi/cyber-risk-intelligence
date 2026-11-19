@@ -213,6 +213,38 @@ CHECKS: tuple[Check, ...] = (
              AND NOT EXISTS (SELECT 1 FROM ingestion_runs r WHERE r.job_name = f.job_name
                              AND r.status IN ('succeeded', 'partial') AND r.started_at > f.started_at)""",
     ),
+    Check(
+        "assurance_verified_from_company_source", "error",
+        "A certification is marked verified but its evidence comes from the company's own website. "
+        "Only an independent register can verify one.",
+        "SELECT count(*) FROM security_assurances WHERE verification_status = 'verified'",
+        """SELECT 'security_assurances', a.id, a.framework || ' marked verified from company source ' || s.source_key
+           FROM security_assurances a JOIN evidence_versions v ON v.id = a.evidence_version_id
+           JOIN sources s ON s.id = v.source_id
+           WHERE a.verification_status = 'verified' AND s.source_type = 'company_website'""",
+    ),
+    Check(
+        "assurance_register_lapsed_but_claimed", "warning",
+        "The company still claims a certification that its register entry shows as withdrawn, suspended or expired, "
+        "and no register shows it active. Skipped when the register status is unknown.",
+        "SELECT count(*) FROM company_assurance_summary WHERE company_claims + company_documents > 0",
+        """SELECT 'companies', v.company_id, v.framework || coalesce(' ' || v.report_type, '')
+                  || ' is claimed by the company but the register entry is no longer active'
+           FROM company_assurance_summary v
+           WHERE v.status = 'verified_lapsed' AND v.company_claims + v.company_documents > 0
+             AND NOT EXISTS (SELECT 1 FROM security_assurances a WHERE a.company_id = v.company_id
+                             AND a.framework = v.framework AND a.report_type IS NOT DISTINCT FROM v.report_type
+                             AND a.basis = 'issuer_directory' AND a.directory_status = 'unknown')""",
+    ),
+    Check(
+        "assurance_claim_expired", "info",
+        "The latest certificate or report date we have for a claimed certification has passed. "
+        "A newer one may exist that we have not seen; skipped when no date is known.",
+        "SELECT count(*) FROM company_assurance_summary WHERE latest_valid_until IS NOT NULL",
+        """SELECT 'companies', v.company_id, v.framework || coalesce(' ' || v.report_type, '')
+                  || ' latest known validity ended ' || v.latest_valid_until
+           FROM company_assurance_summary v WHERE v.status = 'claimed' AND v.validity = 'expired'""",
+    ),
 )
 
 EVIDENCE_BYTES_CHECK = Check(
