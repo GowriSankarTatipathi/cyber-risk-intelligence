@@ -50,3 +50,16 @@ def session(engine):
         finally:
             s.close()
             trans.rollback()
+
+
+@pytest.fixture
+def session_factory(engine):
+    """Sessions that may commit; everything is rolled back after the test."""
+    from sqlalchemy.orm import sessionmaker
+
+    with engine.connect() as conn:
+        trans = conn.begin()
+        try:
+            yield sessionmaker(bind=conn, join_transaction_mode="create_savepoint", expire_on_commit=False)
+        finally:
+            trans.rollback()

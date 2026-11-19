@@ -18,10 +18,19 @@ pytest                      # uses TEST_DATABASE_URL; it is wiped and rebuilt on
 
 The `cyber_app` role needs `CREATE` on the database (it owns it in the standard setup). The first migration runs `CREATE EXTENSION IF NOT EXISTS btree_gist`, which is a trusted extension, so the database owner can install it.
 
+## Loading data
+
+```bash
+python -m cyber_risk_intelligence.ingest run seed-companies path/to/companies-200-seed.csv
+```
+
+See [17.8](docs/schema/17.8-ingestion-and-data-quality.md) for retries and how to write new import jobs.
+
 ## Layout
 
 * `src/cyber_risk_intelligence/models/`: SQLAlchemy models
 * `src/cyber_risk_intelligence/normalize.py`: identifier, name and domain normalization
 * `src/cyber_risk_intelligence/evidence/`: checksummed evidence storage (local folder or MinIO)
+* `src/cyber_risk_intelligence/ingest/`: repeatable import runs with validation, error records and retries
 * `migrations/`: Alembic migrations
-* `docs/schema/`: one page per schema issue ([17.1 company and legal entities](docs/schema/17.1-company-legal-entity.md), [17.7 evidence storage](docs/schema/17.7-evidence-storage.md))
+* `docs/schema/`: one page per schema issue ([17.1 company and legal entities](docs/schema/17.1-company-legal-entity.md), [17.7 evidence storage](docs/schema/17.7-evidence-storage.md), [17.8 ingestion](docs/schema/17.8-ingestion-and-data-quality.md))
