@@ -10,9 +10,15 @@ from .company import (
     IndustryClassification,
     LegalEntity,
 )
+from .ingestion import DataVersion, IngestionCursor, IngestionError, IngestionRun, ValidationResult
 from .evidence import EvidenceLink, EvidenceObject, EvidenceVersion, Source
 
 __all__ = [
+    "ValidationResult",
+    "IngestionRun",
+    "IngestionError",
+    "IngestionCursor",
+    "DataVersion",
     "Base",
     "Company",
     "CompanyAlias",
