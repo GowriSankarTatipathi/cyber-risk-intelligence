@@ -66,6 +66,11 @@ class HeaderFetcher:
                                             redirects=redirects)
                     url = nxt
                     continue
+                if r.status_code >= 400:
+                    # An error page (often a bot filter's 403) is not the website: its headers say
+                    # nothing about the site's own, so they are not graded.
+                    return PageResponse(start, "request_failed", f"HTTP {r.status_code} from {url}; "
+                                        "headers of an error page are not graded", url, redirects=redirects)
                 return PageResponse(start, "answered", None, url, r.status_code, redirects,
                                     [(k.decode("latin-1"), v.decode("latin-1")) for k, v in r.headers.raw])
             return PageResponse(start, "request_failed", f"more than {MAX_REDIRECTS} redirects", redirects=redirects)

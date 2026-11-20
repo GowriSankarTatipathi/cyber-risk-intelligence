@@ -283,8 +283,9 @@ class DkimJob(_TxtJob):
             else:
                 values = [txt_value(a) for a in row.answers or []]
                 dkim = [v for v in values if "p=" in v.replace(" ", "") or v.strip().startswith("v=DKIM1")]
-                if not dkim:
-                    ev.outcome, ev.problem = "invalid", "TXT record here is not a DKIM key"
+                if not dkim:  # e.g. a wildcard TXT (*._domainkey) answering every name: no key here
+                    ev.outcome, ev.problem = "not_found", "only a non-DKIM TXT record answers here (often a wildcard)"
+                    ev.record_text = "\n".join(values)[:500]
                 elif len(dkim) > 1:
                     ev.outcome, ev.problem, ev.record_text = "invalid", f"{len(dkim)} DKIM records", "\n".join(dkim)
                 else:

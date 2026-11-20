@@ -7,11 +7,15 @@ gets one result:
 * ``pass``: present with a protective value;
 * ``weak``: present but with a value that leaves the protection partly open;
 * ``missing``: the site answered and the header was not sent;
-* ``invalid``: present but unusable (malformed, or sent more than once with different values,
-  which browsers treat as an error or ignore);
+* ``invalid``: present but unusable (malformed, or a value browsers ignore);
 * ``info``: recorded for context only, not graded.
 
-A request that failed (timeout, refused, TLS error) never produces header results: it is recorded on
+A header sent more than once is read the way browsers read it: for HSTS only the first counts
+(RFC 6797 §8.1); X-Frame-Options, X-Content-Type-Options and Referrer-Policy values are combined
+into one list (HTML, Fetch and Referrer Policy specifications); every CSP applies.
+
+A request that failed (timeout, refused, TLS error, or an HTTP error page such as a 403 from a bot
+filter) never produces header results: it is recorded on
 the check as ``request_failed``, so a site we could not reach is never counted as missing headers.
 """
 
@@ -19,7 +23,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-ASSESSMENT_VERSION = "cri-headers-1"
+ASSESSMENT_VERSION = "cri-headers-2"
 RESULTS = ("pass", "weak", "missing", "invalid", "info")
 HSTS_MIN_AGE = 15552000  # 180 days, the Observatory's threshold
 
@@ -91,27 +95,43 @@ def _csp(v: str) -> tuple[str, str | None]:
     return ("weak", note) if problems else ("pass", None)
 
 
-def _xfo(v: str) -> tuple[str, str | None]:
-    low = v.strip().lower()
-    if low in ("deny", "sameorigin"):
+def _items(values: list[str]) -> list[str]:
+    """Every header value split on commas, as browsers combine repeated headers."""
+    return [p.strip() for v in values for p in v.split(",") if p.strip()]
+
+
+def _hsts_first(values: list[str]) -> tuple[str, str | None]:
+    return _hsts(values[0])  # RFC 6797 §8.1: only the first header is processed
+
+
+def _xfo(values: list[str]) -> tuple[str, str | None]:
+    # HTML "check a navigation response's adherence to X-Frame-Options"
+    found = list(dict.fromkeys(i.lower() for i in _items(values)))
+    if len(found) > 1:
+        if {"deny", "sameorigin", "allowall"} & set(found):
+            return "pass", "conflicting values; browsers then block all framing"
+        return "invalid", "several values that browsers ignore"
+    if found and found[0] in ("deny", "sameorigin"):
         return "pass", None
-    return "invalid", f"{v.strip()!r} is not DENY or SAMEORIGIN (ALLOW-FROM is ignored by browsers)"
+    shown = values[0].strip()
+    return "invalid", f"{shown[:80]!r} is not DENY or SAMEORIGIN (ALLOW-FROM is ignored by browsers)"
 
 
-def _xcto(v: str) -> tuple[str, str | None]:
-    return ("pass", None) if v.strip().lower() == "nosniff" else ("invalid", "only 'nosniff' is valid")
+def _xcto(values: list[str]) -> tuple[str, str | None]:
+    items = _items(values)  # Fetch "determine nosniff": the first value decides
+    return ("pass", None) if items and items[0].lower() == "nosniff" else ("invalid", "only 'nosniff' is valid")
 
 
-def _referrer(v: str) -> tuple[str, str | None]:
-    # A comma-separated list is allowed: the last value the browser understands wins.
-    values = [p.strip().lower() for p in v.split(",") if p.strip()]
+def _referrer(values: list[str]) -> tuple[str, str | None]:
+    # A comma-separated list (or several headers) is allowed: the last value the browser understands wins.
+    values = [p.lower() for p in _items(values)]
     known = [p for p in values if p in _SAFE_REFERRER | _UNSAFE_REFERRER]
     if not known:
         return "invalid", "no recognised policy"
     return ("pass", None) if known[-1] in _SAFE_REFERRER else ("weak", f"{known[-1]} sends the full URL to other sites")
 
 
-_GRADERS = {"strict-transport-security": _hsts, "content-security-policy": _csp, "x-frame-options": _xfo,
+_GRADERS = {"strict-transport-security": _hsts_first, "x-frame-options": _xfo,
             "x-content-type-options": _xcto, "referrer-policy": _referrer}
 
 
@@ -133,19 +153,17 @@ def assess(headers: list[tuple[str, str]], https: bool = True) -> list[HeaderRes
                 out.append(HeaderResult(header, None, 0, "missing"))
             continue
         joined = "\n".join(values)
-        distinct = list(dict.fromkeys(v.strip() for v in values))
-        if header != "content-security-policy" and len(distinct) > 1:
-            # Several CSP headers all apply (the strictest wins); for the others browsers reject or pick one.
-            out.append(HeaderResult(header, joined, len(values), "invalid", f"sent {len(values)} times with different values"))
-            continue
-        if header == "content-security-policy":
+        if header == "content-security-policy":  # several policies all apply; one strong one is enough
             graded = [_csp(v) for v in values]
             result = "pass" if any(r == "pass" for r, _ in graded) else graded[0][0]
             note = next((n for r, n in graded if r == result), None)
         else:
-            result, note = _GRADERS[header](distinct[0])
+            result, note = _GRADERS[header](values)
             if len(values) > 1:
-                note = "; ".join(filter(None, [note, f"sent {len(values)} times"]))
+                same = len({v.strip().lower() for v in values}) == 1
+                extra = f"sent {len(values)} times" + ("" if same else " with different values") + \
+                    ("; browsers use the first" if header == "strict-transport-security" and not same else "")
+                note = "; ".join(filter(None, [note, extra]))
         out.append(HeaderResult(header, joined, len(values), result, note))
     for header in CONTEXT:
         values = by_name.get(header)
