@@ -1,6 +1,8 @@
 """crt.sh database as a CT source (no live calls: the connection is a stand-in)."""
 # ruff: noqa: F811  (the acme and store fixtures come from test_ct)
 
+import socket
+import threading
 from datetime import UTC, datetime
 
 import pytest
@@ -235,3 +237,63 @@ def test_default_clients_ask_the_database_first(store):
 @pytest.fixture(autouse=True)
 def _no_env(monkeypatch):
     monkeypatch.delenv("CT_DB_MAX_CERTS", raising=False)
+
+
+
+class HangingConnection(FakeConnection):
+    """A query that only ends when cancelled (if ``honour_cancel``) or when its socket is cut."""
+
+    def __init__(self, honour_cancel):
+        super().__init__({}, [])
+        self.honour_cancel, self.cancelled = honour_cancel, threading.Event()
+        self.ours, self.theirs = socket.socketpair()
+        self.ours.settimeout(5)
+        self.pgconn = self
+
+    @property
+    def socket(self):
+        return self.ours.fileno()
+
+    def cancel_safe(self, timeout=None):
+        if self.honour_cancel:
+            self.cancelled.set()
+            self.theirs.send(b"x")  # the server answers the cancel
+
+    def execute(self, sql, params=None):
+        if self.ours.recv(1) == b"x" and self.cancelled.is_set():
+            raise RuntimeError("canceling statement due to user request")
+        raise RuntimeError("server closed the connection unexpectedly")
+
+
+@pytest.mark.parametrize("honour_cancel", [True, False])
+def test_query_that_runs_too_long_is_stopped(honour_cancel):
+    conn = HangingConnection(honour_cancel)
+    client = CrtShDbClient(connect=lambda: conn, query_timeout_s=0.05, cancel_grace_s=0.2)
+    result = client.search("acme.example")
+    assert result.outcome == "lookup_failed" and "query stopped after 0 s" in result.message
+    assert conn.closed  # and the broken connection is closed
+
+
+def test_job_waits_for_the_database_rather_than_cert_spotter(session_factory, store, acme):
+    attempts = []
+
+    def connect():
+        attempts.append(1)
+        if len(attempts) == 1:
+            raise OSError("connection refused")
+        return FakeConnection({"acme.example": [row(801, "8a", ["vpn.acme.example"])]}, [])
+
+    client = CrtShDbClient(connect=connect, connect_attempts=1, retry_after_s=120)
+    broken, _ = crtsh({"acme.example": [(504, b"")]})
+    job = CtJob(store, [client, broken])
+    job._wait = lambda s: setattr(client, "_retry_at", 0.0)  # the wait passes at once
+    from cyber_risk_intelligence.ingest import run_import
+
+    from .test_ct import csv_bytes
+
+    run = run_import(session_factory, store, job, csv_bytes(["company_key", "domain"], ["acme", "acme.example"]),
+                     source_url="file:///t.csv")
+    assert run.status == "succeeded" and len(attempts) == 2
+    with session_factory() as s:
+        lookup = s.scalars(select(CtLookup)).one()
+    assert lookup.request_url.startswith("postgresql://") and lookup.outcome == "answered"

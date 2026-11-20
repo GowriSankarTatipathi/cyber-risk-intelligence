@@ -24,6 +24,9 @@ domain with thousands of certificates answers in seconds, with no paging and no 
   covered by hundreds of near-identical certificates, gives one certificate, not hundreds. The
   narrowing happens inside crt.sh, so only that much is sent and stored. ``latest_per_name=False``
   (``ct collect --all-certificates``) keeps every certificate.
+* A query that runs longer than ``query_timeout_s`` (5 minutes) is cancelled, and if it still hasn't
+  returned 30 s later the connection is cut (the pooler takes no ``statement_timeout`` and crt.sh
+  doesn't always honour a cancel). The domain then goes to the next source.
 * ``max_certs`` (``CT_DB_MAX_CERTS``, default 300,000) caps the (certificate, name) matches read; a
   search that reaches it is marked incomplete.
 
@@ -36,6 +39,7 @@ import json
 import logging
 import os
 import socket
+import threading
 import time
 from urllib.parse import urlencode
 
@@ -115,11 +119,13 @@ def to_entry(row: dict, with_common_name: bool = True) -> CtEntry | None:
 class CrtShDbClient:
     source = "crt.sh"  # the same index as the web search; request_url says it was asked through SQL
 
-    def __init__(self, connect=None, max_certs: int | None = None, connect_timeout_s: int = 15, latest_per_name: bool = True, connect_attempts: int = 3,
+    def __init__(self, connect=None, max_certs: int | None = None, connect_timeout_s: int = 15,
+                 query_timeout_s: float = 300.0, cancel_grace_s: float = 30.0, latest_per_name: bool = True, connect_attempts: int = 3,
                  backoff_s: float = 5.0, retry_after_s: float = 300.0, max_outages: int = 3):
         self._connect = connect or self._psycopg_connect
         self.max_certs = max_certs or int(os.environ.get("CT_DB_MAX_CERTS") or 300_000)
-        self.connect_timeout_s = connect_timeout_s
+        self.connect_timeout_s, self.query_timeout_s = connect_timeout_s, query_timeout_s
+        self.cancel_grace_s = cancel_grace_s
         self.connect_attempts, self.backoff_s = connect_attempts, backoff_s
         self.retry_after_s, self.max_outages = retry_after_s, max_outages
         self._conn = None
@@ -172,6 +178,46 @@ class CrtShDbClient:
                     self._sleep(self.backoff_s * (attempt + 1))
         return self._conn
 
+    def ready_in(self) -> float:
+        """Seconds until the database is tried again after an outage (0 = now; never when given up)."""
+        return 0.0 if self._down else max(0.0, self._retry_at - time.monotonic())
+
+    @staticmethod
+    def _abort(conn, done: threading.Event, fired: threading.Event, grace_s: float) -> None:
+        """Stop a query that has run too long. The pooler takes no statement_timeout, and crt.sh doesn't
+        always honour a cancel request, so ask once and, if the query still hasn't returned after
+        ``grace_s``, cut the connection (the blocked read then fails and the domain moves on)."""
+        fired.set()
+        try:
+            conn.cancel_safe(timeout=min(grace_s, 30))
+        except Exception as exc:  # noqa: BLE001
+            log.debug("crt.sh database: cancel failed: %s", exc)
+        if done.wait(grace_s):
+            return
+        try:
+            # a duplicate of psycopg's socket: shutting it down ends the blocked read, and closing the
+            # duplicate leaves psycopg's own file descriptor alone
+            with socket.socket(fileno=os.dup(conn.pgconn.socket)) as sk:
+                sk.shutdown(socket.SHUT_RDWR)
+        except Exception as exc:  # noqa: BLE001
+            log.debug("crt.sh database: could not cut the connection: %s", exc)
+
+    def _execute(self, conn, sql: str, params: dict):
+        done, fired = threading.Event(), threading.Event()
+        timer = threading.Timer(self.query_timeout_s, self._abort, args=(conn, done, fired, self.cancel_grace_s))
+        timer.daemon = True
+        timer.start()
+        try:
+            cur = conn.execute(sql, params)
+            return cur, cur.fetchall()
+        except Exception as exc:
+            if fired.is_set():
+                raise TimeoutError(f"query stopped after {self.query_timeout_s:.0f} s") from exc
+            raise
+        finally:
+            done.set()
+            timer.cancel()
+
     def close(self) -> None:
         if self._conn is not None:
             try:
@@ -184,16 +230,16 @@ class CrtShDbClient:
         conn = self._connection()
         query = _LATEST_QUERY if self.latest_per_name else _QUERY
         try:
-            cur = conn.execute(query.format(tbs=_TBS if self._with_tbs else "NULL"), params)
+            cur, rows = self._execute(conn, query.format(tbs=_TBS if self._with_tbs else "NULL"), params)
         except Exception as exc:
             if self._with_tbs and "does not exist" in str(exc):  # digest() or the strip function missing
                 log.warning("crt.sh database: no TBS hash available (%s); using issuer and serial only", exc)
                 self._with_tbs = False
-                cur = conn.execute(query.format(tbs="NULL"), params)
+                cur, rows = self._execute(conn, query.format(tbs="NULL"), params)
             else:
                 raise
         names = [d[0] for d in cur.description]
-        return [dict(zip(names, r, strict=True)) for r in cur.fetchall()]
+        return [dict(zip(names, r, strict=True)) for r in rows]
 
     def search(self, domain: str) -> CtLookupResult:
         url = request_url(domain)
