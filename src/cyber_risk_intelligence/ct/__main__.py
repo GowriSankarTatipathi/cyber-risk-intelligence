@@ -47,7 +47,8 @@ def website_summary(sf) -> None:
     with sf() as s:
         rows = s.execute(text(
             "SELECT c.company_key, w.host, w.outcome, coalesce(w.message, '') AS msg, "
-            "coalesce(substring(w.issuer_name from 'O=([^,]+)'), w.issuer_name, '') AS issuer, "
+            "coalesce(replace(substring(w.issuer_name from 'O=((?:\\\\,|[^,])+)'), '\\', ''), w.issuer_name, '') "
+            "AS issuer, "
             "w.not_after::date AS expires, (w.not_after::date - current_date) AS days_left "
             "FROM latest_website_certificates w JOIN company_domains cd ON cd.domain_id = w.domain_id "
             "AND cd.valid_to IS NULL JOIN companies c ON c.id = cd.company_id ORDER BY c.company_key, w.host")).all()

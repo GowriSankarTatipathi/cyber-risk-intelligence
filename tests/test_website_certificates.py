@@ -134,6 +134,8 @@ def test_nothing_listening_is_unreachable_not_a_missing_certificate():
 def test_only_the_domain_and_its_www_host_are_asked():
     assert hosts_for("acme.example") == ["acme.example", "www.acme.example"]
     assert hosts_for("www.acme.example") == ["www.acme.example"]
+    assert hosts_for("corporate.acme.example") == ["corporate.acme.example"]
+    assert hosts_for("acme.co.uk") == ["acme.co.uk", "www.acme.co.uk"]
 
 
 # --- the job ---------------------------------------------------------------------------------------------
