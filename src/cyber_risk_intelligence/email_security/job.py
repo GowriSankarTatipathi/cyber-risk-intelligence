@@ -1,12 +1,12 @@
-"""Collect SPF (issue 23.1) and DMARC (issue 23.2) records for company domains.
+"""Collect SPF (23.1), DMARC (23.2), DKIM (23.3) and MTA-STS / TLS reporting (23.4) for company domains.
 
 Input is a CSV ``company_key,domain`` (``python -m cyber_risk_intelligence.email_security targets``
 writes one from ``company_domains``). For each row the job asks a public resolver for TXT
 records (``<domain>`` for SPF, ``_dmarc.<domain>`` for DMARC), stores each answer as evidence,
 records each lookup in ``dns_security_records`` and what it shows in ``email_security_observations``.
 
-Only TXT queries are made. No mail or report is sent and nothing on the company's servers is
-contacted directly. A failed lookup is ``lookup_failed``: it is never read as "no record".
+Only TXT queries are made, plus (23.4) one HTTPS GET of the MTA-STS policy file when the domain's
+DNS announces one. No mail or report is sent. A failed lookup is ``lookup_failed``: it is never read as "no record".
 """
 
 from __future__ import annotations
@@ -36,10 +36,20 @@ from ..models.email_security import (
     DkimEvidence,
     DnsSecurityRecord,
     EmailSecurityObservation,
+    MtaStsObservation,
+    TlsReportingObservation,
 )
 from .dkim import KnownSelector, read_dkim, selectors_from_spf
 from .dmarc import organizational_domain, read_dmarc
 from .dns import DnsResolver, Resolver
+from .mta_sts import (
+    PolicyFetcher,
+    policy_url,
+    read_policy,
+    read_sts_record,
+    read_tlsrpt_record,
+    report_addresses,
+)
 from .spf import read_spf, txt_value
 
 DNS_SOURCE = SourceSpec(
@@ -284,6 +294,100 @@ class DkimJob(_TxtJob):
             s.add(ev)
         s.flush()
         return "unchanged" if all_same else "inserted"
+
+
+MTA_STS_POLICY_SOURCE = SourceSpec(
+    source_key="mta_sts_policies",
+    name="MTA-STS policy files",
+    source_type="other",
+    access_method="api",
+    notes="GET of https://mta-sts.<domain>/.well-known/mta-sts.txt, only when the domain's DNS announces "
+          "a policy (RFC 8461). No redirects followed; at most 64 KB.",
+)
+
+
+def _txt_values(row: DnsSecurityRecord) -> list[str]:
+    return [txt_value(a) for a in row.answers or []] if row.outcome == "answered" else []
+
+
+class MtaStsJob(_TxtJob):
+    """MTA-STS (``_mta-sts.<domain>`` plus its policy file) and TLS reporting (``_smtp._tls.<domain>``),
+    issue 23.4; see ``mta_sts``. The policy file is fetched only when DNS announces a policy."""
+
+    name = "mta_sts"
+    dataset_key = "mta_sts_targets"
+    control = "mta_sts"
+
+    def __init__(self, store: ObjectStore, resolver: Resolver | None = None, fetcher: PolicyFetcher | None = None):
+        super().__init__(store, resolver)
+        self._fetcher = fetcher
+
+    @property
+    def fetcher(self) -> PolicyFetcher:
+        if self._fetcher is None:
+            self._fetcher = PolicyFetcher()
+        return self._fetcher
+
+    def write(self, ctx: WriteContext) -> RowStatus:
+        company, domain = self._target(ctx)
+        s = ctx.session
+        sts_row, same_sts = self._lookup(ctx, domain, f"_mta-sts.{domain.name}")
+        obs = MtaStsObservation(company_id=company.id, domain_id=domain.id, dns_record_id=sts_row.id,
+                                policy_url=policy_url(domain.name), policy_retrieval="not_attempted",
+                                observed_at=sts_row.queried_at, ingestion_run_id=ctx.run.id)
+        problems: list[str] = []
+        if sts_row.outcome == "lookup_failed":
+            obs.dns_status, obs.message = "lookup_failed", sts_row.message or sts_row.rcode or "lookup failed"
+        else:
+            rec = read_sts_record(_txt_values(sts_row))
+            obs.dns_status, obs.record_text, obs.sts_id = rec.status, rec.record, rec.tags.get("id")
+            problems += rec.problems
+        same_policy = True
+        if obs.dns_status in ("present", "invalid", "multiple"):
+            previous = s.scalar(select(MtaStsObservation.policy_evidence_version_id)
+                                .where(MtaStsObservation.domain_id == domain.id)
+                                .order_by(MtaStsObservation.id.desc()).limit(1))
+            fetched = self.fetcher.fetch(domain.name)
+            obs.policy_retrieval, obs.policy_http_status, obs.message = fetched.outcome, fetched.http_status, \
+                fetched.message
+            if fetched.outcome == "retrieved":
+                text = (fetched.body or b"").decode("utf-8", errors="replace")
+                try:
+                    version = record_evidence(
+                        s, self.store, source=ensure_source(s, MTA_STS_POLICY_SOURCE), source_url=fetched.url,
+                        content=fetched.body or b"", media_type="text/plain", http_status=fetched.http_status,
+                        title=f"MTA-STS policy of {domain.name}")
+                except SecretDetected as exc:
+                    raise RowRejected("withheld", f"MTA-STS policy of {domain.name} not stored: {exc}",
+                                      "domain") from None
+                policy = read_policy(text)
+                obs.policy_evidence_version_id = version.id
+                obs.policy_status, obs.mode, obs.max_age = policy.status, policy.mode, policy.max_age
+                obs.mx_patterns = policy.mx or None
+                problems += policy.problems
+                same_policy = previous == version.id
+            else:
+                same_policy = False
+        obs.problems = problems or None
+        s.add(obs)
+
+        rpt_row, same_rpt = self._lookup(ctx, domain, f"_smtp._tls.{domain.name}")
+        rpt = TlsReportingObservation(company_id=company.id, domain_id=domain.id, dns_record_id=rpt_row.id,
+                                      observed_at=rpt_row.queried_at, evidence_version_id=rpt_row.evidence_version_id,
+                                      ingestion_run_id=ctx.run.id)
+        if rpt_row.outcome == "lookup_failed":
+            rpt.status, rpt.problems = "lookup_failed", [rpt_row.message or rpt_row.rcode or "lookup failed"]
+        else:
+            r = read_tlsrpt_record(_txt_values(rpt_row))
+            rpt.status, rpt.record_text, rpt.problems = r.status, r.record, r.problems or None
+            rpt.report_uris = report_addresses(r) or None
+        s.add(rpt)
+        s.flush()
+        # "updated" counts domains where something could not be read (as the website checks do).
+        # A 404 or a bad certificate is a finding about the domain, not a failure to look.
+        if "lookup_failed" in (sts_row.outcome, rpt_row.outcome) or obs.policy_retrieval == "request_failed":
+            return "updated"
+        return "unchanged" if same_sts and same_rpt and same_policy else "inserted"
 
 
 def targets_csv(s) -> bytes:

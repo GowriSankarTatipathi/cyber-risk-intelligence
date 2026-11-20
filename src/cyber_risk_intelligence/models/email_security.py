@@ -204,3 +204,90 @@ class DkimEvidence(IdMixin, Base):
         CheckConstraint("selector IS NULL OR selector ~ '^[A-Za-z0-9_-]+(\\.[A-Za-z0-9_-]+)*$'",
                         name="selector_label"),
     )
+
+
+TXT_RECORD_STATUSES = ("present", "missing", "invalid", "multiple", "lookup_failed")
+STS_POLICY_RETRIEVALS = ("retrieved", "not_found", "certificate_invalid", "request_failed", "not_attempted")
+STS_POLICY_STATUSES = ("valid", "invalid")
+STS_MODES = ("enforce", "testing", "none")
+
+
+class MtaStsObservation(IdMixin, Base):
+    """Issue 23.4: MTA-STS for a domain. The DNS record, the policy fetch and the policy's validity are
+    kept apart: a failed fetch or lookup is never read as "no MTA-STS"."""
+
+    __tablename__ = "mta_sts_observations"
+
+    company_id: Mapped[int | None] = mapped_column(
+        BigInteger, ForeignKey("companies.id", ondelete="RESTRICT"), index=True
+    )
+    domain_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("domains.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    dns_record_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("dns_security_records.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    dns_status: Mapped[str] = mapped_column(Text, nullable=False)
+    record_text: Mapped[str | None] = mapped_column(Text)
+    sts_id: Mapped[str | None] = mapped_column(Text)
+    policy_url: Mapped[str] = mapped_column(Text, nullable=False)
+    policy_retrieval: Mapped[str] = mapped_column(Text, nullable=False)
+    policy_http_status: Mapped[int | None] = mapped_column(Integer)
+    policy_status: Mapped[str | None] = mapped_column(Text)
+    mode: Mapped[str | None] = mapped_column(Text)
+    mx_patterns: Mapped[list | None] = mapped_column(JSONB(none_as_null=True))
+    max_age: Mapped[int | None] = mapped_column(Integer)
+    problems: Mapped[list | None] = mapped_column(JSONB(none_as_null=True))
+    message: Mapped[str | None] = mapped_column(Text)
+    policy_evidence_version_id: Mapped[int | None] = mapped_column(
+        BigInteger, ForeignKey("evidence_versions.id", ondelete="RESTRICT"), index=True
+    )
+    observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    ingestion_run_id: Mapped[int | None] = mapped_column(
+        BigInteger, ForeignKey("ingestion_runs.id", ondelete="SET NULL"), index=True
+    )
+
+    __table_args__ = (
+        CheckConstraint(in_list("dns_status", TXT_RECORD_STATUSES), name="dns_status"),
+        CheckConstraint(in_list("policy_retrieval", STS_POLICY_RETRIEVALS), name="policy_retrieval"),
+        CheckConstraint("policy_status IS NULL OR " + in_list("policy_status", STS_POLICY_STATUSES),
+                        name="policy_status"),
+        CheckConstraint("mode IS NULL OR " + in_list("mode", STS_MODES), name="mode"),
+        CheckConstraint("(policy_retrieval = 'retrieved') = (policy_status IS NOT NULL)", name="status_when_retrieved"),
+        CheckConstraint("(policy_retrieval = 'retrieved') = (policy_evidence_version_id IS NOT NULL)",
+                        name="evidence_when_retrieved"),
+        CheckConstraint("(policy_retrieval = 'not_attempted') = (dns_status NOT IN ('present', 'invalid', 'multiple'))",
+                        name="fetch_only_when_announced"),
+    )
+
+
+class TlsReportingObservation(IdMixin, Base):
+    """Issue 23.4: SMTP TLS reporting (TLS-RPT) record of a domain. Report addresses are recorded, never contacted."""
+
+    __tablename__ = "tls_reporting_observations"
+
+    company_id: Mapped[int | None] = mapped_column(
+        BigInteger, ForeignKey("companies.id", ondelete="RESTRICT"), index=True
+    )
+    domain_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("domains.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    dns_record_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("dns_security_records.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    status: Mapped[str] = mapped_column(Text, nullable=False)
+    record_text: Mapped[str | None] = mapped_column(Text)
+    report_uris: Mapped[list | None] = mapped_column(JSONB(none_as_null=True))
+    problems: Mapped[list | None] = mapped_column(JSONB(none_as_null=True))
+    observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    evidence_version_id: Mapped[int | None] = mapped_column(
+        BigInteger, ForeignKey("evidence_versions.id", ondelete="RESTRICT"), index=True
+    )
+    ingestion_run_id: Mapped[int | None] = mapped_column(
+        BigInteger, ForeignKey("ingestion_runs.id", ondelete="SET NULL"), index=True
+    )
+
+    __table_args__ = (
+        CheckConstraint(in_list("status", TXT_RECORD_STATUSES), name="status"),
+        CheckConstraint("(status = 'lookup_failed') = (evidence_version_id IS NULL)", name="evidence_unless_failed"),
+    )
