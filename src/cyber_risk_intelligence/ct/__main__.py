@@ -6,8 +6,8 @@
     python -m cyber_risk_intelligence.ct website    # the certificate each company website presents (domain and www.)
 
 Or run on your own list:  python -m cyber_risk_intelligence.ingest run ct targets.csv
-Cert Spotter answers 100 certificates per page in well under a second; crt.sh is the fallback.
-``collect`` goes in two passes: every domain that can be answered without waiting for a rate limit
+The crt.sh database (read-only SQL, one query per domain) is asked first; Cert Spotter (100 certificates
+per page, hourly allowance) and the crt.sh web search are the fallbacks. ``collect`` goes in two passes: every domain that can be answered without waiting for a rate limit
 first, then the ones left over (the big ones), which wait for Cert Spotter and carry on where they stopped.
 """
 
