@@ -6,9 +6,13 @@
 
 Or run on your own list:  python -m cyber_risk_intelligence.ingest run ct targets.csv
 Cert Spotter answers 100 certificates per page in well under a second; crt.sh is the fallback.
+``collect`` goes in two passes: every domain that can be answered without waiting for a rate limit
+first, then the ones left over (the big ones), which wait for Cert Spotter and carry on where they stopped.
 """
 
 import argparse
+import csv
+import io
 import sys
 from collections import Counter
 
@@ -52,11 +56,29 @@ def main(argv=None) -> int:
     store = store_from_env()
     with sf() as s:
         content = targets_csv(s)
-    r = run_import(sf, store, CtJob(store), content, source_url="db:company_domains")
-    print(f"run {r.id} {r.status}: {r.rows_seen} domains, {r.rows_inserted} with new certificates, "
-          f"{r.rows_unchanged} unchanged, {r.rows_updated} failed lookups, {r.rows_rejected} rejected")
+    quick = CtJob(store, defer=True)
+    r = run_import(sf, store, quick, content, source_url="db:company_domains")
+    report(r, len(quick.deferred))
+    ok = r.status == "succeeded"
+    if quick.deferred:
+        print(f"now the {len(quick.deferred)} domains left for later: "
+              + ", ".join(d for _, d in quick.deferred))
+        buf = io.StringIO()
+        w = csv.writer(buf)
+        w.writerow(["company_key", "domain"])
+        w.writerows(quick.deferred)
+        r = run_import(sf, store, CtJob(store, clients=quick.clients), buf.getvalue().encode(),
+                       source_url="db:company_domains (deferred)")
+        report(r, 0)
+        ok = ok and r.status == "succeeded"
     summary(sf)
-    return 0 if r.status == "succeeded" else 2
+    return 0 if ok else 2
+
+
+def report(r, deferred: int) -> None:
+    print(f"run {r.id} {r.status}: {r.rows_seen} domains, {r.rows_inserted} with new certificates, "
+          f"{r.rows_unchanged - deferred} unchanged, {r.rows_updated} failed lookups, {r.rows_rejected} rejected"
+          + (f", {deferred} left for later" if deferred else ""))
 
 
 if __name__ == "__main__":

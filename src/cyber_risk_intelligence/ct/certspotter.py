@@ -75,6 +75,10 @@ class CertSpotterClient:
         self.patience = patience
         self._last = 0.0
         self._blocked_until = 0.0
+        # When True, a long rate limit part-way through a domain returns at once (``deferred``) instead of
+        # waiting; the pages read so far are kept here and the next search of that domain carries on.
+        self.defer_on_limit = False
+        self._partial: dict[str, tuple[list, str | None, int]] = {}
 
     def ready_in(self) -> float:
         """Seconds until the rate-limit allowance is back (0 when requests can be made now)."""
@@ -128,17 +132,27 @@ class CertSpotterClient:
 
     def search(self, domain: str) -> CtLookupResult:
         first = request_url(domain)
+        if domain in self._partial and not self.defer_on_limit and self.ready_in():
+            # a big domain left part-way: nothing else can answer it, so wait here and carry on
+            log.warning("%s: waiting %.0f s for the Cert Spotter rate limit", domain, self.ready_in())
+            self._wait(self.ready_in())
+            self._blocked_until = 0.0
         if self.ready_in():
             return CtLookupResult(self.source, "lookup_failed", first, 429,
                                   f"rate limited for another {self.ready_in():.0f} s; not asked")
-        items: list = []
-        after, pages, status = None, 0, None
+        items, after, pages = self._partial.pop(domain, ([], None, 0))
+        status = None
         while True:
             if pages >= self.max_pages:
                 return self._result(domain, first, items, pages, 200, False,
                                     f"stopped after {pages} pages ({len(items)} certificates); more exist")
-            page, status, error = self._page(request_url(domain, after), give_up_on_long_limit=not items)
+            page, status, error = self._page(request_url(domain, after),
+                                             give_up_on_long_limit=self.defer_on_limit or not items)
             if page is None:
+                if items and self.defer_on_limit and status == 429:
+                    self._partial[domain] = (items, after, pages)
+                    return CtLookupResult(self.source, "lookup_failed", first, 429,
+                                          f"{error} after {pages} pages; left for later", deferred=True)
                 if not items:
                     return CtLookupResult(self.source, "lookup_failed", first, status, error)
                 return self._result(domain, first, items, pages, status, False,

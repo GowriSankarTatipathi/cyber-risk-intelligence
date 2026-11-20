@@ -308,3 +308,38 @@ def test_waits_for_certspotter_when_crtsh_cannot_answer(session_factory, store, 
     with session_factory() as s:
         lookup = s.scalars(select(CtLookup)).one()
     assert (lookup.source, lookup.complete) == ("certspotter", True) and count(session_factory, Certificate) == 3
+
+
+def test_big_domain_is_left_for_later_and_carries_on_from_its_page(session_factory, store, acme):
+    calls, limited_once = [], []
+
+    def handler(request):
+        after = request.url.params.get("after", "")
+        calls.append(after)
+        if after == "2" and not limited_once:
+            limited_once.append(True)
+            return httpx.Response(429, headers={"Retry-After": "3000"}, content=b"{}")
+        return httpx.Response(200, content=json.dumps(PAGES.get(after, [])).encode())
+
+    big = CertSpotterClient(httpx.Client(transport=httpx.MockTransport(handler)), min_delay=0, retries=2,
+                            backoff=0)
+    small, crtsh_calls = crtsh({"globex.example": [(200, [])]})
+    rows = csv_bytes(["company_key", "domain"], ["acme", "acme.example"], ["globex", "globex.example"])
+
+    quick = CtJob(store, [big, small], defer=True)
+    run_import(session_factory, store, quick, rows, source_url="file:///t.csv")
+    assert quick.deferred == [("acme", "acme.example")]
+    assert crtsh_calls == ["globex.example"]  # the big domain was not handed to crt.sh
+    with session_factory() as s:
+        assert [lk.query for lk in s.scalars(select(CtLookup))] == ["globex.example"]
+
+    later = CtJob(store, clients=quick.clients)
+    waits = []
+    big._wait = waits.append
+    run_import(session_factory, store, later, csv_bytes(["company_key", "domain"], *quick.deferred),
+               source_url="file:///deferred.csv")
+    assert calls == ["", "2", "2", "3"]  # picked up at page 2, page 1 not asked again
+    assert any(w > 2990 for w in waits)
+    with session_factory() as s:
+        lookup = s.scalars(select(CtLookup).where(CtLookup.query == "acme.example")).one()
+    assert (lookup.source, lookup.pages, lookup.complete, lookup.certificate_count) == ("certspotter", 3, True, 3)
