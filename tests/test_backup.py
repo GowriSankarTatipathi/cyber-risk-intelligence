@@ -69,6 +69,16 @@ def test_test_and_review_schedules_are_not_backup_frequencies():
     assert freqs("Backups are tested monthly.") == []
 
 
+def test_wording_from_published_questionnaires():
+    st = read_backup_statement("Full backups are performed, at least, every seven days direct to disk and are retained "
+                               "for a minimum of fourteen (14) days, with differential backups taken every 24 hours.")
+    assert [(x.frequency_class, x.interval_minutes) for x in st.frequencies] == [("weekly", 10080), ("daily", 1440)]
+    assert st.retention_days == 14 and st.methods == ["full", "differential"]
+    assert freqs("Backup data validation is part of the monthly disaster recovery test.") == []
+    assert freqs("Backup activities can be monitored in real time.") == []
+    assert freqs("Duo backs up data stores housing customer sensitive data at least daily.") == [("daily", 1440)]
+
+
 def test_scope_keeps_product_features_and_customer_duties_apart():
     assert read_backup_statement("We back up customer data daily.").scope == "own_practice"
     assert read_backup_statement("You can schedule backups hourly.").scope == "product_capability"
