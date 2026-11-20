@@ -68,12 +68,37 @@ def test_malformed_values_are_invalid():
 def test_duplicates():
     same = results([("X-Frame-Options", "DENY"), ("x-frame-options", "DENY")])["x-frame-options"]
     assert (same.result, same.value_count) == ("pass", 2) and "sent 2 times" in same.note
-    clash = results([("X-Frame-Options", "DENY"), ("X-Frame-Options", "SAMEORIGIN")])["x-frame-options"]
-    assert clash.result == "invalid" and clash.value == "DENY\nSAMEORIGIN"
+    # X-Frame-Options values combine; conflicting values make browsers block all framing
+    clash = results([("X-Frame-Options", "SAMEORIGIN"), ("X-Frame-Options", "ALLOW-FROM https://x")])["x-frame-options"]
+    assert clash.result == "pass" and clash.value == "SAMEORIGIN\nALLOW-FROM https://x" and "block" in clash.note
+    assert results([("X-Frame-Options", "SAMEORIGIN, SAMEORIGIN")])["x-frame-options"].result == "pass"
+    assert results([("X-Frame-Options", "ALLOW-FROM https://a"),
+                    ("X-Frame-Options", "ALLOW-FROM https://b")])["x-frame-options"].result == "invalid"
     # several CSP headers all apply; one strong policy is enough
     csp = results([("Content-Security-Policy", "default-src *"),
                    ("Content-Security-Policy", "script-src 'self'")])["content-security-policy"]
     assert csp.result == "pass" and csp.value_count == 2
+
+
+def test_repeated_headers_are_read_as_browsers_read_them():
+    # HSTS: only the first header counts (a later max-age=0 doesn't turn it off)
+    hsts = results([("Strict-Transport-Security", "max-age=31536000; includeSubDomains"),
+                    ("Strict-Transport-Security", "max-age=0")])["strict-transport-security"]
+    assert hsts.result == "pass" and "browsers use the first" in hsts.note and hsts.value_count == 2
+    assert results([("Strict-Transport-Security", "max-age:31536000")])["strict-transport-security"].result == "invalid"
+    # Referrer-Policy: the last recognised value wins, across headers too
+    ref = results([("Referrer-Policy", "strict-origin-when-cross-origin"),
+                   ("Referrer-Policy", "no-referrer-when-downgrade")])["referrer-policy"]
+    assert ref.result == "weak" and "no-referrer-when-downgrade" in ref.note
+    # X-Content-Type-Options: the first value decides
+    assert results([("X-Content-Type-Options", "nosniff"), ("X-Content-Type-Options", "nosniff")]
+                   )["x-content-type-options"].result == "pass"
+    assert results([("X-Content-Type-Options", "no sniff")])["x-content-type-options"].result == "invalid"
+
+
+def test_error_page_is_not_graded():
+    blocked = fetcher({"https://acme.example/": (403, [("Server", "AkamaiGHost")])}).page("acme.example")
+    assert blocked.outcome == "request_failed" and "HTTP 403" in blocked.message and blocked.headers == []
 
 
 def test_hsts_on_plain_http_page_is_missing_with_reason():

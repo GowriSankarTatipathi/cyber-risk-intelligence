@@ -189,6 +189,16 @@ def test_failed_lookup_is_kept_apart(session_factory, store, acme):
     assert (e.outcome, e.evidence_version_id, e.problem) == ("lookup_failed", None, "timed out")
 
 
+def test_wildcard_txt_at_a_selector_is_not_a_key(session_factory, store, acme):
+    spf = [["v=spf1 include:servers.mcsv.net -all"]]
+    collect(session_factory, store, {"acme.example": spf, "servers.mcsv.net": [["v=spf1 -all"]],
+                                     "k2._domainkey.acme.example": spf, "k3._domainkey.acme.example": spf})
+    with session_factory() as s:
+        rows = s.scalars(select(DkimEvidence)).all()
+    assert {e.outcome for e in rows} == {"not_found"} and all("wildcard" in e.problem for e in rows)
+    assert rows[0].record_text.startswith("v=spf1")
+
+
 def test_published_selector_is_used_with_its_source(session_factory, store, acme, tmp_path):
     path = tmp_path / "selectors.csv"
     path.write_text("company_key,domain,selector,source_url\n"
