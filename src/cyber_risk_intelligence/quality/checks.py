@@ -279,6 +279,19 @@ CHECKS: tuple[Check, ...] = (
                   || ' latest known validity ended ' || v.latest_valid_until
            FROM company_assurance_summary v WHERE v.status = 'claimed' AND v.validity = 'expired'""",
     ),
+    Check(
+        "backup_frequency_not_stated", "info",
+        "The company says it backs up its own systems but none of its statements says how often. "
+        "The frequency stays unknown; it is not assumed.",
+        """SELECT count(DISTINCT company_id) FROM backup_policy_claims
+           WHERE scope = 'own_practice' AND assertion = 'affirmed'""",
+        """SELECT 'companies', b.company_id, 'backups mentioned in '
+                  || count(DISTINCT b.claim_hash) || ' statement(s), frequency not stated'
+           FROM backup_policy_claims b
+           WHERE b.scope = 'own_practice' AND b.assertion = 'affirmed'
+           GROUP BY b.company_id
+           HAVING bool_and(b.frequency_class IS NULL)""",
+    ),
 )
 
 EVIDENCE_BYTES_CHECK = Check(
