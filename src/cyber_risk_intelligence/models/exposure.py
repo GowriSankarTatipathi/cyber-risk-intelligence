@@ -1,6 +1,7 @@
 """Issue 10.3: indexed exposure from Shodan InternetDB.
 
-* ``indexed_host_lookups``: one row per (company host, IP) per run: which host and IP were looked up,
+* ``indexed_host_lookups``: one row per (company host, IP) per run: which host (website, own mail host,
+  or a side host named in the company's CT certificates) and IP were looked up,
   how the lookup ended, Shodan's tags, host names, software (CPE) and inferred CVEs, and how far the
   IP can be tied to the company (``attribution``). A failed DNS or InternetDB lookup is kept as such,
   never read as "nothing exposed".
@@ -28,7 +29,8 @@ from sqlalchemy.orm import Mapped, mapped_column
 
 from .base import Base, IdMixin, in_list
 
-HOST_ROLES = ("website", "mail")
+HOST_ROLES = ("website", "mail", "certificate_name")
+NAME_HINTS = ("remote_access", "file_transfer", "admin", "mail", "identity", "development")
 LOOKUP_OUTCOMES = ("found", "not_indexed", "lookup_failed", "dns_failed", "no_address")
 ATTRIBUTIONS = ("cdn", "company_only", "shared", "unknown")
 
@@ -44,6 +46,7 @@ class IndexedHostLookup(IdMixin, Base):
     )
     host: Mapped[str] = mapped_column(Text, nullable=False)
     host_role: Mapped[str] = mapped_column(Text, nullable=False)
+    name_hint: Mapped[str | None] = mapped_column(Text)  # certificate_name hosts: what the name suggests
     ip: Mapped[str | None] = mapped_column(INET, index=True)
     source: Mapped[str] = mapped_column(Text, nullable=False)
     outcome: Mapped[str] = mapped_column(Text, nullable=False)
@@ -65,6 +68,7 @@ class IndexedHostLookup(IdMixin, Base):
     __table_args__ = (
         CheckConstraint(in_list("host_role", HOST_ROLES), name="host_role"),
         CheckConstraint(in_list("outcome", LOOKUP_OUTCOMES), name="outcome"),
+        CheckConstraint("name_hint IS NULL OR " + in_list("name_hint", NAME_HINTS), name="name_hint"),
         CheckConstraint("attribution IS NULL OR " + in_list("attribution", ATTRIBUTIONS), name="attribution"),
         CheckConstraint("(ip IS NULL) = (outcome IN ('dns_failed', 'no_address'))", name="ip_unless_unresolved"),
         CheckConstraint("(outcome = 'found') = (evidence_version_id IS NOT NULL)", name="evidence_when_found"),
