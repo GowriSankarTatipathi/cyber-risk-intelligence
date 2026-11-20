@@ -35,8 +35,8 @@ def row(id_, serial, names, tbs=None, issuer=ISSUER):
 
 
 class FakeCursor:
-    def __init__(self, rows):
-        self.description = [(c,) for c in COLUMNS]
+    def __init__(self, rows, columns=COLUMNS):
+        self.description = [(c,) for c in columns]
         self._rows = rows
 
     def fetchall(self):
@@ -46,31 +46,34 @@ class FakeCursor:
 class FakeConnection:
     """Answers each domain from ``answers``; an Exception in the list is raised instead."""
 
-    def __init__(self, answers, log):
-        self.answers, self.log, self.closed = answers, log, False
+    def __init__(self, answers, log, columns=COLUMNS):
+        self.answers, self.log, self.closed, self.sql, self.columns = answers, log, False, [], columns
 
     def execute(self, sql, params=None):
         if params is None:  # SET statement_timeout
             return FakeCursor([])
         self.log.append((params["domain"], "x509_tbscert_strip_ct_ext" in sql))
+        self.sql.append(sql)
         answer = self.answers[params["domain"]]
         result = answer.pop(0) if isinstance(answer, list) and answer and isinstance(answer[0], Exception) else answer
         if isinstance(result, Exception):
             raise result
-        return FakeCursor(result)
+        return FakeCursor(result, self.columns)
 
     def close(self):
         self.closed = True
 
 
-def db(answers, fail_connect=None, **kw):
+def db(answers, fail_connect=None, columns=COLUMNS, **kw):
     log, connects = [], []
 
     def connect():
-        connects.append(1)
         if fail_connect:
+            connects.append(1)
             raise fail_connect
-        return FakeConnection(answers, log)
+        conn = FakeConnection(answers, log, columns)
+        connects.append(conn)
+        return conn
 
     return CrtShDbClient(connect=connect, **kw), log, connects
 
@@ -167,6 +170,33 @@ def test_answer_at_the_cap_is_incomplete(session_factory, store, acme):
     with session_factory() as s:
         lookup = s.scalars(select(CtLookup)).one()
     assert (lookup.outcome, lookup.complete) == ("answered", False) and "more exist" in lookup.message
+
+
+def test_newest_certificate_per_name_by_default(session_factory, store, acme):
+    # The narrowing is done by crt.sh (the WITH query); the common name of the kept certificate is not
+    # added back, since that name's own newest certificate may be another one.
+    client, _, connects = db({"acme.example": [row(501, "5a", ["www.acme.example"], tbs="f" * 64)]})
+    collect(session_factory, store, {}, clients=[client])
+    sql = connects[0].sql[-1]
+    assert "DISTINCT ON (name)" in sql and "count(*) FROM hits" in sql
+    with session_factory() as s:
+        assert set(s.scalars(select(CertificateHostname.hostname))) == {"www.acme.example"}
+
+
+def test_all_certificates_on_request(session_factory, store, acme):
+    client, _, connects = db({"acme.example": [row(601, "6a", ["www.acme.example"], tbs="f" * 64)]},
+                             latest_per_name=False)
+    collect(session_factory, store, {}, clients=[client])
+    assert "DISTINCT ON" not in connects[0].sql[-1]
+
+
+def test_cap_counts_matches_read_not_rows_returned(session_factory, store, acme):
+    # one certificate kept, but crt.sh read 5 (certificate, name) matches: the cap of 5 was reached
+    client, _, _ = db({"acme.example": [(*row(701, "7a", ["a.acme.example"]), 5)]}, max_certs=5,
+                      columns=(*COLUMNS, "hits"))
+    collect(session_factory, store, {}, clients=[client])
+    with session_factory() as s:
+        assert s.scalars(select(CtLookup)).one().complete is False
 
 
 def test_default_clients_ask_the_database_first(store):

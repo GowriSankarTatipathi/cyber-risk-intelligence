@@ -13,8 +13,13 @@ domain with thousands of certificates answers in seconds, with no paging and no 
   database can't be reached at all (port 5432 blocked, server down), the client stops trying for the
   rest of the run instead of waiting on every domain. So does a query the server rejects as not
   fitting its schema (SQLSTATE class 42), which would fail the same way for every domain.
-* ``max_certs`` (``CT_DB_MAX_CERTS``, default 300,000) caps the answer; a search that reaches it is
-  marked incomplete.
+* By default only the **newest certificate for each host name** is kept (``latest_per_name``): every
+  name the domain has a current certificate for is still found, but a name renewed every 90 days, or
+  covered by hundreds of near-identical certificates, gives one certificate, not hundreds. The
+  narrowing happens inside crt.sh, so only that much is sent and stored. ``latest_per_name=False``
+  (``ct collect --all-certificates``) keeps every certificate.
+* ``max_certs`` (``CT_DB_MAX_CERTS``, default 300,000) caps the (certificate, name) matches read; a
+  search that reaches it is marked incomplete.
 
 Only the crt.sh database is contacted; none of the hosts named in a certificate is.
 """
@@ -32,24 +37,45 @@ HOST, PORT, USER, DBNAME = "crt.sh", 5432, "guest", "certwatch"
 BASE_URL = f"postgresql://{USER}@{HOST}:{PORT}/{DBNAME}"
 log = logging.getLogger(__name__)
 
-_TBS = "encode(digest(x509_tbscert_strip_ct_ext(c.certificate), 'sha256'), 'hex')"
-_QUERY = """
+_COLUMNS = """
 SELECT c.id, ca.name AS issuer_name, c.issuer_ca_id,
        encode(x509_serialNumber(c.certificate), 'hex') AS serial_number,
        x509_commonName(c.certificate) AS common_name,
        x509_notBefore(c.certificate) AS not_before,
        x509_notAfter(c.certificate) AS not_after,
        {tbs} AS tbs_sha256,
-       m.names
-FROM (
-    SELECT cai.certificate_id, array_agg(DISTINCT lower(cai.name_value)) AS names
+       m.names"""
+_MATCH = """
     FROM certificate_and_identities cai
     WHERE plainto_tsquery('certwatch', %(domain)s) @@ identities(cai.certificate)
       AND (lower(cai.name_value) = %(domain)s OR lower(cai.name_value) LIKE %(like)s ESCAPE '!')
-      AND coalesce(x509_notAfter(cai.certificate), 'infinity') >= (now() AT TIME ZONE 'UTC')
+      AND coalesce(x509_notAfter(cai.certificate), 'infinity') >= (now() AT TIME ZONE 'UTC')"""
+_TBS = "encode(digest(x509_tbscert_strip_ct_ext(c.certificate), 'sha256'), 'hex')"
+# Every certificate, with the names that match the domain.
+_QUERY = _COLUMNS + """
+FROM (
+    SELECT cai.certificate_id, array_agg(DISTINCT lower(cai.name_value)) AS names""" + _MATCH + """
     GROUP BY cai.certificate_id
     LIMIT %(limit)s
 ) m
+JOIN certificate c ON c.id = m.certificate_id
+JOIN ca ON ca.id = c.issuer_ca_id
+"""
+# Newest certificate per name: the matches, then one certificate per name (latest not_before), then
+# that certificate's names gathered again. ``hits`` = matches read, to tell whether the cap was reached.
+_LATEST_QUERY = """
+WITH hits AS (
+    SELECT DISTINCT lower(cai.name_value) AS name, cai.certificate_id,
+           x509_notBefore(cai.certificate) AS not_before""" + _MATCH + """
+    LIMIT %(limit)s
+), latest AS (
+    SELECT DISTINCT ON (name) name, certificate_id FROM hits
+    ORDER BY name, not_before DESC NULLS LAST, certificate_id DESC
+), m AS (
+    SELECT certificate_id, array_agg(name ORDER BY name) AS names FROM latest GROUP BY certificate_id
+)""" + _COLUMNS + """,
+       (SELECT count(*) FROM hits) AS hits
+FROM m
 JOIN certificate c ON c.id = m.certificate_id
 JOIN ca ON ca.id = c.issuer_ca_id
 """
@@ -63,7 +89,7 @@ def _like(domain: str) -> str:
     return "%." + domain.replace("!", "!!").replace("%", "!%").replace("_", "!_")
 
 
-def to_entry(row: dict) -> CtEntry | None:
+def to_entry(row: dict, with_common_name: bool = True) -> CtEntry | None:
     issuer = (row.get("issuer_name") or "").strip()
     serial = "".join(ch for ch in str(row.get("serial_number") or "").lower() if ch in "0123456789abcdef")
     tbs = (row.get("tbs_sha256") or "").lower() or None
@@ -72,7 +98,8 @@ def to_entry(row: dict) -> CtEntry | None:
     common = (row.get("common_name") or "").strip() or None
     return CtEntry(
         entry_id=str(row["id"]), source_ref=f"https://crt.sh/?id={row['id']}", issuer_name=issuer,
-        names=names_of([*(row.get("names") or []), common or ""]), serial_number=serial or None,
+        names=names_of([*(row.get("names") or []), (common or "") if with_common_name else ""]),
+        serial_number=serial or None,
         tbs_sha256=tbs if tbs and len(tbs) == 64 else None, issuer_ca_id=row.get("issuer_ca_id"),
         common_name=common, not_before=when(row.get("not_before")), not_after=when(row.get("not_after")))
 
@@ -81,13 +108,14 @@ class CrtShDbClient:
     source = "crt.sh"  # the same index as the web search; request_url says it was asked through SQL
 
     def __init__(self, connect=None, max_certs: int | None = None, statement_timeout_s: int = 300,
-                 connect_timeout_s: int = 15):
+                 connect_timeout_s: int = 15, latest_per_name: bool = True):
         self._connect = connect or self._psycopg_connect
         self.max_certs = max_certs or int(os.environ.get("CT_DB_MAX_CERTS") or 300_000)
         self.statement_timeout_s, self.connect_timeout_s = statement_timeout_s, connect_timeout_s
         self._conn = None
         self._down: str | None = None  # why the database can't be reached; set once, then not retried
         self._with_tbs = True
+        self.latest_per_name = latest_per_name
 
     def _psycopg_connect(self):
         import psycopg
@@ -114,13 +142,14 @@ class CrtShDbClient:
     def _rows(self, domain: str) -> list[dict]:
         params = {"domain": domain, "like": _like(domain), "limit": self.max_certs}
         conn = self._connection()
+        query = _LATEST_QUERY if self.latest_per_name else _QUERY
         try:
-            cur = conn.execute(_QUERY.format(tbs=_TBS if self._with_tbs else "NULL"), params)
+            cur = conn.execute(query.format(tbs=_TBS if self._with_tbs else "NULL"), params)
         except Exception as exc:
             if self._with_tbs and "does not exist" in str(exc):  # digest() or the strip function missing
                 log.warning("crt.sh database: no TBS hash available (%s); using issuer and serial only", exc)
                 self._with_tbs = False
-                cur = conn.execute(_QUERY.format(tbs="NULL"), params)
+                cur = conn.execute(query.format(tbs="NULL"), params)
             else:
                 raise
         names = [d[0] for d in cur.description]
@@ -146,12 +175,14 @@ class CrtShDbClient:
                 log.warning("crt.sh database: %s; using the other CT sources for this run", self._down)
             return CtLookupResult(self.source, "lookup_failed", url, None,
                                   f"database query failed: {type(exc).__name__}: {str(exc).strip()[:300]}")
-        entries = [e for e in (to_entry(r) for r in rows) if e]
-        complete = len(rows) < self.max_certs
+        entries = [e for e in (to_entry(r, not self.latest_per_name) for r in rows) if e]
+        read = max((r.get("hits") or 0 for r in rows), default=0) or len(rows)
+        complete = read < self.max_certs
         content = json.dumps({"query": domain, "source": "crt.sh database", "exclude": "expired",
+                              "kept": "newest certificate per name" if self.latest_per_name else "all",
                               "complete": complete, "certificates": rows},
                              default=lambda v: v.isoformat() if hasattr(v, "isoformat") else str(v),
                              ensure_ascii=False).encode()
         return CtLookupResult(self.source, "answered" if entries else "no_results", url, None,
-                              None if complete else f"stopped at {self.max_certs} certificates; more exist",
+                              None if complete else f"stopped at {self.max_certs} matches; more exist",
                               content, entries, pages=1, complete=complete)
