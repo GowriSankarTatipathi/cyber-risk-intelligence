@@ -65,6 +65,8 @@ def dkim_summary(sf) -> None:
             "SELECT c.company_key, d.name, coalesce(l.selector, '') AS sel, l.outcome, "
             "coalesce(l.key_type || ' ' || l.key_bits, '') AS key, coalesce(l.problem, '') AS problem, "
             "coalesce(substring(l.selector_evidence from 'authorizes ([^(]+) \\('), "
+            "substring(l.selector_evidence from '^MX \\S+ is ([^;]+);') || ' (MX)', "
+            "substring(l.selector_evidence from 'publishes (.+)''s domain verification') || ' (verification)', "
             "CASE l.selector_source WHEN 'published' THEN 'published' END, '') AS via "
             "FROM latest l JOIN domains d ON d.id = l.domain_id LEFT JOIN companies c ON c.id = l.company_id "
             "WHERE l.ingestion_run_id IS NOT DISTINCT FROM l.last_run ORDER BY c.company_key, d.name, l.selector")).all()

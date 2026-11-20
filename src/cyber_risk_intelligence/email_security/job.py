@@ -39,7 +39,12 @@ from ..models.email_security import (
     MtaStsObservation,
     TlsReportingObservation,
 )
-from .dkim import KnownSelector, read_dkim, selectors_from_spf
+from .dkim import (
+    KnownSelector,
+    read_dkim,
+    selectors_from_mail_records,
+    selectors_from_spf,
+)
 from .dmarc import organizational_domain, read_dmarc
 from .dns import DnsResolver, Resolver
 from .mta_sts import (
@@ -242,7 +247,7 @@ class DmarcJob(_TxtJob):
 
 class DkimJob(_TxtJob):
     """DKIM keys at selectors known from public evidence (issue 23.3; see ``dkim``). Selectors come from
-    the providers the domain's SPF record authorizes, plus any in ``published`` ((company_key, domain) ->
+    the providers the domain's SPF record authorizes or its MX / verification records show, plus any in ``published`` ((company_key, domain) ->
     [KnownSelector]). No selector is guessed."""
 
     name = "dkim"
@@ -258,7 +263,8 @@ class DkimJob(_TxtJob):
         company, domain = self._target(ctx)
         s = ctx.session
         known = [*self.published.get((company.company_key, domain.name), []),
-                 *selectors_from_spf(domain.name, self.resolver.txt)]
+                 *selectors_from_spf(domain.name, self.resolver.txt),
+                 *selectors_from_mail_records(domain.name, self.resolver.txt, getattr(self.resolver, "mx", None))]
         unique: dict[str, KnownSelector] = {}
         for k in known:
             unique.setdefault(k.selector.lower(), k)

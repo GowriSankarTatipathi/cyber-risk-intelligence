@@ -9,6 +9,11 @@ don't do. We ask only selectors that public evidence ties to the domain:
   authorizes ``spf.protection.outlook.com``, Microsoft documents that its DKIM keys are at
   ``selector1`` and ``selector2``. The provider, the SPF include that named it and the provider's
   documentation are stored with every result.
+* **Email providers shown by the domain's own MX records or provider verification record.** Mail
+  delivered to ``*.mail.protection.outlook.com``, or an ``MS=`` TXT record (Microsoft's proof that
+  the domain is added to a Microsoft 365 tenant), shows Microsoft 365; MX at Google shows Google
+  Workspace. Many companies put a filter (Proofpoint, Mimecast) in their SPF and MX, so the SPF
+  record alone misses them. The record that showed the provider is stored with every result.
 * **Selectors supplied with a public source** (a CSV ``company_key,domain,selector,source_url``),
   for example a selector seen in the headers of a mail the company published.
 
@@ -33,13 +38,17 @@ class Provider:
     spf_includes: tuple[str, ...]  # an include equal to, or ending in, one of these names the provider
     selectors: tuple[str, ...]
     source_url: str  # the provider's documentation of these selectors
+    mx_hosts: tuple[str, ...] = ()  # an MX host equal to, or ending in, one of these names the provider
+    verification_prefix: str | None = None  # a TXT record at the domain starting with this names the provider
 
 
 PROVIDERS = (
     Provider("Microsoft 365", ("spf.protection.outlook.com",), ("selector1", "selector2"),
-             "https://learn.microsoft.com/en-us/defender-office-365/email-authentication-dkim-configure"),
+             "https://learn.microsoft.com/en-us/defender-office-365/email-authentication-dkim-configure",
+             mx_hosts=("mail.protection.outlook.com",), verification_prefix="MS="),
     Provider("Google Workspace", ("_spf.google.com",), ("google",),
-             "https://support.google.com/a/answer/174124"),
+             "https://support.google.com/a/answer/174124",
+             mx_hosts=("aspmx.l.google.com", "googlemail.com", "smtp.google.com")),
     Provider("Mailchimp", ("servers.mcsv.net",), ("k2", "k3"),
              "https://mailchimp.com/help/set-up-email-domain-authentication/"),
     Provider("SendGrid", ("sendgrid.net",), ("s1", "s2"),
@@ -52,7 +61,7 @@ PROVIDERS = (
 @dataclass
 class KnownSelector:
     selector: str
-    source: str  # spf_provider / published
+    source: str  # spf_provider / mail_provider / published
     evidence: str  # why we know it, in words
     source_url: str
 
@@ -103,6 +112,24 @@ def selectors_from_spf(domain: str, txt) -> list[KnownSelector]:
             for sel in p.selectors:
                 out.append(KnownSelector(sel, "spf_provider", f"SPF authorizes {p.name} ({path}); "
                                          f"{p.name} documents DKIM selector {sel!r}", p.source_url))
+    return out
+
+
+def selectors_from_mail_records(domain: str, txt, mx) -> list[KnownSelector]:
+    """Providers shown by the domain's MX hosts (``mx(name)`` -> host names, or None if the lookup
+    failed) or by a provider's domain verification TXT record at the domain."""
+    out: list[KnownSelector] = []
+    hosts = (mx(domain) or []) if mx is not None else []
+    answer = txt(domain)
+    values = ["".join(a) for a in answer.answers or []] if answer.outcome == "answered" else []
+    for p in PROVIDERS:
+        why = next((f"MX {h} is {p.name}" for h in hosts if any(_matches(h, m) for m in p.mx_hosts)), None)
+        if why is None and p.verification_prefix:
+            why = next((f"{domain} publishes {p.name}'s domain verification record ({v.strip()[:40]})"
+                        for v in values if v.strip().startswith(p.verification_prefix)), None)
+        if why:
+            out += [KnownSelector(sel, "mail_provider", f"{why}; {p.name} documents DKIM selector {sel!r}",
+                                  p.source_url) for sel in p.selectors]
     return out
 
 
