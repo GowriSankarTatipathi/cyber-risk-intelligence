@@ -46,10 +46,16 @@ def _csa_star(store):
     return CsaStarJob(store)
 
 
+def _ct(store):
+    from ..ct import CtJob
+
+    return CtJob(store)
+
+
 # Each entry builds the job; collectors need the evidence store to save pages.
 JOBS = {"seed-companies": lambda store: SeedCompaniesJob(), "trust-center": _trust_center,
         "assurance-directory": _assurance_directory, "company-domains": _company_domains, "spf": _spf,
-        "dmarc": _dmarc, "csa-star": _csa_star}
+        "dmarc": _dmarc, "csa-star": _csa_star, "ct": _ct}
 
 
 def main(argv: list[str] | None = None) -> int:

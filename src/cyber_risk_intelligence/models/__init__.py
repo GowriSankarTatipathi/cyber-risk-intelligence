@@ -15,10 +15,15 @@ from .quality import ValidationFinding, ValidationRun
 from .controls import CollectionTarget, PageFetch, SecurityControlClaim
 from .assurance import SecurityAssurance
 from .backup import BackupPolicyClaim
+from .certificates import Certificate, CertificateHostname, CertificateObservation, CtLookup
 from .email_security import DnsSecurityRecord, EmailSecurityObservation
 from .evidence import EvidenceLink, EvidenceObject, EvidenceVersion, Source
 
 __all__ = [
+    "Certificate",
+    "CertificateHostname",
+    "CertificateObservation",
+    "CtLookup",
     "BackupPolicyClaim",
     "DnsSecurityRecord",
     "EmailSecurityObservation",
