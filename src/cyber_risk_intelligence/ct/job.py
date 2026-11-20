@@ -19,6 +19,8 @@ from __future__ import annotations
 import csv
 import gzip
 import io
+import logging
+import time
 from datetime import UTC, datetime
 
 from sqlalchemy import insert, select, tuple_, update
@@ -66,6 +68,8 @@ CT_SOURCES = {
     ),
 }
 _CHUNK = 500
+MAX_RATE_LIMIT_WAIT = 3600.0
+log = logging.getLogger(__name__)
 
 
 def _suffixes(name: str) -> list[str]:
@@ -101,16 +105,37 @@ class CtJob(Job):
             self._clients = [CertSpotterClient(), CrtShClient()]
         return self._clients
 
+    def _wait(self, seconds: float) -> None:
+        time.sleep(seconds)
+
     def search(self, name: str) -> CtLookupResult:
+        """Ask each client in turn. A client that is only rate limited (``ready_in``) is skipped while the
+        others are asked; if none of them can answer, wait for it (up to an hour) and ask it again.
+        That keeps small domains moving through crt.sh while the big ones wait for Cert Spotter."""
         failures = []
         for client in self.clients:
             result = client.search(name)
             if result.outcome != "lookup_failed":
-                if failures:
-                    result.message = "; ".join([*failures, *([result.message] if result.message else [])])
-                return result
+                return self._with_failures(result, failures)
             failures.append(f"{result.source}: {result.message}")
+        for client in self.clients:
+            wait = getattr(client, "ready_in", lambda: 0.0)()
+            if 0 < wait <= MAX_RATE_LIMIT_WAIT:
+                log.warning("%s: other sources failed; waiting %.0f s for the %s rate limit", name, wait,
+                            client.source)
+                self._wait(wait)
+                retry = client.search(name)
+                if retry.outcome != "lookup_failed":
+                    return self._with_failures(retry, failures)
+                failures.append(f"{retry.source}: {retry.message}")
+                result = retry
         result.message = "; ".join(failures)
+        return result
+
+    @staticmethod
+    def _with_failures(result: CtLookupResult, failures: list[str]) -> CtLookupResult:
+        if failures:
+            result.message = "; ".join([*failures, *([result.message] if result.message else [])])
         return result
 
     def parse(self, content: bytes):

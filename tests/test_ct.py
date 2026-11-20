@@ -68,7 +68,7 @@ def crtsh(responses):
     return client, calls
 
 
-def spotter(pages_by_after, status_seq=None, max_pages=None):
+def spotter(pages_by_after, status_seq=None, max_pages=None, retry_after="0"):
     """A CertSpotterClient answering from ``pages_by_after``: after-id ('' for the first page) -> items.
     ``status_seq`` is a list of statuses to answer with first (e.g. [429])."""
     calls, statuses = [], list(status_seq or [])
@@ -78,7 +78,7 @@ def spotter(pages_by_after, status_seq=None, max_pages=None):
         calls.append(after)
         if statuses:
             code = statuses.pop(0)
-            return httpx.Response(code, headers={"Retry-After": "0"}, content=b"{}")
+            return httpx.Response(code, headers={"Retry-After": retry_after}, content=b"{}")
         return httpx.Response(200, content=json.dumps(pages_by_after.get(after, [])).encode())
 
     client = CertSpotterClient(httpx.Client(transport=httpx.MockTransport(handler)), min_delay=0, retries=2,
@@ -274,3 +274,37 @@ def test_falls_back_to_crtsh_when_certspotter_fails(session_factory, store, acme
         lookup = s.scalars(select(CtLookup)).one()
     assert lookup.source == "crt.sh" and calls == ["acme.example"] and "certspotter: HTTP 503" in lookup.message
     assert count(session_factory, Certificate) == 3
+
+
+def test_long_rate_limit_moves_on_to_crtsh_and_stops_asking(session_factory, store, acme):
+    limited, spotter_calls = spotter(PAGES, status_seq=[429], retry_after="3000")
+    fallback, crtsh_calls = crtsh({"acme.example": [(200, ACME)], "globex.example": [(200, [])]})
+    run, _ = collect(session_factory, store, {}, ["acme", "acme.example"], ["globex", "globex.example"],
+                     clients=[limited, fallback])
+    assert run.status == "succeeded"
+    assert spotter_calls == [""]  # asked once; the second domain went straight to crt.sh
+    assert crtsh_calls == ["acme.example", "globex.example"]
+    with session_factory() as s:
+        lookups = s.scalars(select(CtLookup).order_by(CtLookup.id)).all()
+    assert [lk.source for lk in lookups] == ["crt.sh", "crt.sh"]
+    assert "rate limited" in lookups[1].message
+
+
+def test_waits_for_certspotter_when_crtsh_cannot_answer(session_factory, store, acme):
+    limited, spotter_calls = spotter(PAGES, status_seq=[429], retry_after="3000")
+    broken, _ = crtsh({"acme.example": [(504, b"")]})
+    job = CtJob(store, [limited, broken])
+    waited = []
+
+    def fake_wait(seconds):
+        waited.append(seconds)
+        limited._blocked_until = 0.0
+
+    job._wait = fake_wait
+    run = run_import(session_factory, store, job, csv_bytes(["company_key", "domain"], ["acme", "acme.example"]),
+                     source_url="file:///t.csv")
+    assert run.status == "succeeded" and len(waited) == 1 and 2990 < waited[0] <= 3000
+    assert spotter_calls == ["", "", "2", "3"]
+    with session_factory() as s:
+        lookup = s.scalars(select(CtLookup)).one()
+    assert (lookup.source, lookup.complete) == ("certspotter", True) and count(session_factory, Certificate) == 3
