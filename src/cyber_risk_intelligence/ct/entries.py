@@ -47,6 +47,7 @@ class CtLookupResult:
     entries: list[CtEntry] = field(default_factory=list)
     pages: int | None = None
     complete: bool = True  # False when the search stopped before the last page
+    deferred: bool = False  # rate limited part-way; the search can pick up where it stopped later
 
 
 def when(value) -> datetime | None:

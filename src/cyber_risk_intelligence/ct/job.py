@@ -94,33 +94,48 @@ class CtJob(Job):
              else f"{r.get('domain')!r} is not a domain name", field="domain"),
     )
 
-    def __init__(self, store: ObjectStore, clients: list | None = None):
-        """``clients`` are tried in order until one answers (default: Cert Spotter, then crt.sh)."""
+    def __init__(self, store: ObjectStore, clients: list | None = None, defer: bool = False):
+        """``clients`` are tried in order until one answers (default: Cert Spotter, then crt.sh).
+
+        With ``defer``, a domain that would have to wait for a rate limit is not recorded but added to
+        ``deferred`` (``company_key``, ``domain``) to run afterwards, so small domains all finish first.
+        Run the deferred ones with the same ``clients`` so Cert Spotter carries on from the page it reached.
+        """
         self.store = store
         self._clients = clients
+        self.defer = defer
+        self.deferred: list[tuple[str, str]] = []
 
     @property
     def clients(self) -> list:
         if self._clients is None:
             self._clients = [CertSpotterClient(), CrtShClient()]
+        for client in self._clients:
+            if hasattr(client, "defer_on_limit"):
+                client.defer_on_limit = self.defer
         return self._clients
 
     def _wait(self, seconds: float) -> None:
         time.sleep(seconds)
 
-    def search(self, name: str) -> CtLookupResult:
+    def search(self, name: str) -> CtLookupResult | None:
         """Ask each client in turn. A client that is only rate limited (``ready_in``) is skipped while the
         others are asked; if none of them can answer, wait for it (up to an hour) and ask it again.
-        That keeps small domains moving through crt.sh while the big ones wait for Cert Spotter."""
+        That keeps small domains moving through crt.sh while the big ones wait for Cert Spotter.
+        With ``defer``, returns None instead of waiting (the domain goes to ``deferred``)."""
         failures = []
         for client in self.clients:
             result = client.search(name)
+            if result.deferred:  # part-way through a big domain: crt.sh can't answer those, so don't ask it
+                return None
             if result.outcome != "lookup_failed":
                 return self._with_failures(result, failures)
             failures.append(f"{result.source}: {result.message}")
         for client in self.clients:
             wait = getattr(client, "ready_in", lambda: 0.0)()
             if 0 < wait <= MAX_RATE_LIMIT_WAIT:
+                if self.defer:
+                    return None
                 log.warning("%s: other sources failed; waiting %.0f s for the %s rate limit", name, wait,
                             client.source)
                 self._wait(wait)
@@ -159,6 +174,10 @@ class CtJob(Job):
                                                    "import it with company-domains first", "domain")
 
         result = self.search(name)
+        if result is None:
+            self.deferred.append((r["company_key"], r["domain"]))
+            log.warning("%s: rate limited; left until the other domains are done", name)
+            return "unchanged"
         now = datetime.now(UTC)
         lookup = CtLookup(domain_id=domain.id, query=name, source=result.source, request_url=result.request_url,
                           queried_at=now, outcome=result.outcome, http_status=result.http_status,
