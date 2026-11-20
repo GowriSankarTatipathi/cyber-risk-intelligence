@@ -292,6 +292,22 @@ CHECKS: tuple[Check, ...] = (
            GROUP BY b.company_id
            HAVING bool_and(b.frequency_class IS NULL)""",
     ),
+    Check(
+        "ct_lookup_failed", "warning",
+        "The latest Certificate Transparency search for a company domain failed (crt.sh timeout, 5xx, rate limit "
+        "or an answer too large to read). Its certificates are unknown, not absent; run it again later.",
+        "SELECT count(*) FROM latest_ct_lookups",
+        """SELECT 'domains', l.domain_id, d.name || ' last CT search failed: ' || coalesce(l.message, '')
+           FROM latest_ct_lookups l JOIN domains d ON d.id = l.domain_id WHERE l.outcome = 'lookup_failed'""",
+    ),
+    Check(
+        "company_domain_without_ct_lookup", "info",
+        "A current company domain has never been searched in Certificate Transparency logs.",
+        "SELECT count(*) FROM company_domains WHERE valid_to IS NULL",
+        """SELECT 'company_domains', cd.id, d.name || ' has no CT search yet'
+           FROM company_domains cd JOIN domains d ON d.id = cd.domain_id
+           WHERE cd.valid_to IS NULL AND NOT EXISTS (SELECT 1 FROM ct_lookups l WHERE l.domain_id = cd.domain_id)""",
+    ),
 )
 
 EVIDENCE_BYTES_CHECK = Check(
