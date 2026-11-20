@@ -1,12 +1,13 @@
-"""Command line for issues 23.1, 23.2 and 23.3.
+"""Command line for issues 23.1, 23.2, 23.3 and 23.4.
 
     python -m cyber_risk_intelligence.email_security spf       # look up SPF for every known company domain
     python -m cyber_risk_intelligence.email_security dmarc     # look up DMARC for every known company domain
     python -m cyber_risk_intelligence.email_security dkim [--selectors published.csv]
         # DKIM keys at selectors known from public evidence (SPF-named providers, plus the CSV:
         # company_key,domain,selector,source_url)
+    python -m cyber_risk_intelligence.email_security mta-sts   # MTA-STS record + policy file, TLS reporting record
     python -m cyber_risk_intelligence.email_security targets   # print the company_key,domain list they use
-    python -m cyber_risk_intelligence.email_security summary [spf|dmarc|dkim]   # latest result per domain
+    python -m cyber_risk_intelligence.email_security summary [spf|dmarc|dkim|mta-sts]   # latest result per domain
 
 Load domains first:  python -m cyber_risk_intelligence.ingest run company-domains company_domains.csv
 """
@@ -22,7 +23,7 @@ from ..db import make_engine, make_session_factory
 from ..evidence import store_from_env
 from ..ingest import run_import
 from .dkim import KnownSelector
-from .job import DkimJob, DmarcJob, SpfJob, targets_csv
+from .job import DkimJob, DmarcJob, MtaStsJob, SpfJob, targets_csv
 
 
 def spf_summary(sf) -> None:
@@ -78,6 +79,28 @@ def dkim_summary(sf) -> None:
     print(", ".join(f"{k}: {v}" for k, v in status.most_common()) or "no DKIM lookups yet")
 
 
+def mta_sts_summary(sf) -> None:
+    with sf() as s:
+        rows = s.execute(text(
+            "WITH m AS (SELECT o.*, row_number() OVER (PARTITION BY o.domain_id ORDER BY o.id DESC) AS n "
+            "FROM mta_sts_observations o), t AS (SELECT o.*, row_number() OVER (PARTITION BY o.domain_id "
+            "ORDER BY o.id DESC) AS n FROM tls_reporting_observations o) "
+            "SELECT c.company_key, d.name, m.dns_status, m.policy_retrieval, coalesce(m.policy_status, '') AS ps, "
+            "coalesce(m.mode, '') AS mode, coalesce(t.status, '') AS rpt, "
+            "coalesce(m.problems ->> 0, m.message, '') AS problem "
+            "FROM m JOIN domains d ON d.id = m.domain_id LEFT JOIN companies c ON c.id = m.company_id "
+            "LEFT JOIN t ON t.domain_id = m.domain_id AND t.n = 1 WHERE m.n = 1 ORDER BY c.company_key, d.name")).all()
+    print(f"{'company':36} {'domain':30} {'sts record':13} {'policy fetch':20} {'policy':8} {'mode':8} tls-rpt")
+    for r in rows:
+        print(f"{r.company_key or '':36} {r.name:30} {r.dns_status:13} {r.policy_retrieval:20} {r.ps:8} {r.mode:8} "
+              f"{r.rpt:13} {r.problem[:50]}")
+    modes = Counter(r.mode for r in rows if r.ps == "valid")
+    print(", ".join(f"record {k}: {v}" for k, v in Counter(r.dns_status for r in rows).most_common())
+          or "no MTA-STS lookups yet")
+    print(", ".join(f"valid policy mode={k}: {v}" for k, v in modes.most_common()))
+    print(", ".join(f"tls-rpt {k}: {v}" for k, v in Counter(r.rpt for r in rows).most_common()))
+
+
 def published_selectors(path: str) -> dict[tuple[str, str], list[KnownSelector]]:
     """company_key,domain,selector,source_url rows: selectors seen in public sources."""
     out: dict[tuple[str, str], list[KnownSelector]] = {}
@@ -92,13 +115,14 @@ def published_selectors(path: str) -> dict[tuple[str, str], list[KnownSelector]]
     return out
 
 
-JOBS = {"spf": (SpfJob, spf_summary), "dmarc": (DmarcJob, dmarc_summary), "dkim": (DkimJob, dkim_summary)}
+JOBS = {"spf": (SpfJob, spf_summary), "dmarc": (DmarcJob, dmarc_summary), "dkim": (DkimJob, dkim_summary),
+        "mta-sts": (MtaStsJob, mta_sts_summary)}
 
 
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(prog="python -m cyber_risk_intelligence.email_security")
-    p.add_argument("command", choices=("spf", "dmarc", "dkim", "targets", "summary"))
-    p.add_argument("control", nargs="?", choices=tuple(JOBS), default="spf", help="for summary: spf, dmarc or dkim")
+    p.add_argument("command", choices=(*JOBS, "targets", "summary"))
+    p.add_argument("control", nargs="?", choices=tuple(JOBS), default="spf", help="for summary: spf, dmarc, dkim or mta-sts")
     p.add_argument("--selectors", help="dkim: CSV of company_key,domain,selector,source_url seen in public sources")
     args = p.parse_args(argv)
     sf = make_session_factory(make_engine())
