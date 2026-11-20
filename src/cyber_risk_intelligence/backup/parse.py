@@ -21,9 +21,11 @@ FREQUENCY_CLASSES = ("continuous", "sub_hourly", "hourly", "sub_daily", "daily",
 SCOPES = ("own_practice", "product_capability", "customer_responsibility")
 METHODS = ("full", "incremental", "differential", "snapshot", "replication")
 
-_NUM = r"(\d+|one|two|three|four|five|six|eight|ten|twelve|fifteen|thirty)"
-_WORDS = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "eight": 8, "ten": 10, "twelve": 12,
-          "fifteen": 15, "thirty": 30}
+_NUM = (r"(\d+|one|two|three|four|five|six|seven|eight|nine|ten|twelve|fourteen|fifteen|twenty|thirty|"
+        r"sixty|ninety)")
+_WORDS = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7, "eight": 8, "nine": 9,
+          "ten": 10, "twelve": 12, "fourteen": 14, "fifteen": 15, "twenty": 20, "thirty": 30, "sixty": 60,
+          "ninety": 90}
 _UNIT_MINUTES = {"minute": 1, "min": 1, "hour": 60, "hr": 60, "day": 1440, "week": 10080, "month": 43200}
 
 # (pattern, class, interval in minutes); checked in this order, first hit at a position wins.
@@ -41,7 +43,12 @@ _FREQUENCIES: list[tuple[re.Pattern, str | None, int | None]] = [
 ]
 # A schedule word tied to testing or review is not a backup frequency.
 _NOT_BACKUP_SCHEDULE = re.compile(r"\b(test(?:ed|s|ing)?|review(?:ed|s)?|exercis(?:e|ed|es)|audit(?:ed|s)?|"
-                                  r"drills?|validat(?:e|ed|es)|verif(?:y|ied|ies)|restor(?:e|ed|ation) tests?)\b", I)
+                                  r"drills?|validat(?:e|ed|es)|verif(?:y|ied|ies)|restor(?:e|ed|ation) tests?|"
+                                  r"monitor(?:ed|s|ing)?)\b", I)
+# ... or right after it ("monthly disaster recovery test").
+# Only words that qualify the noun in between; "nightly and restore tests ..." is still a backup schedule.
+_SCHEDULE_OF_TEST = re.compile(r"^[ -]+(?:(?!and\b|or\b|with\b|while\b|but\b)[a-z/-]+ ){0,3}?"
+                               r"(tests?|testing|reviews?|exercises?|audits?|drills?)\b", I)
 
 _PRODUCT = re.compile(r"\b(you can|you may|lets you|allows? (?:you|customers|users|admins|administrators) to|"
                       r"enables? (?:you|customers|users) to|customers can|users can|admins can|"
@@ -60,7 +67,7 @@ _METHOD = {
     "snapshot": re.compile(r"\bsnapshots?\b", I),
     "replication": re.compile(r"\breplicat", I),
 }
-_RETENTION = re.compile(rf"(?:retain(?:ed)?|kept|stored|retention(?: period)?(?: of)?)\D{{0,25}}?{_NUM}\s*[- ]?"
+_RETENTION = re.compile(rf"(?:retain(?:ed)?|kept|stored|retention(?: period)?(?: of)?)\D{{0,25}}?{_NUM}(?:\s*\(\d+\))?\s*[- ]?"
                         r"(day|week|month|year)s?|" + _NUM + r"[- ](day|week|month|year)s?[- ]retention", I)
 _OBJECTIVE = re.compile(rf"\b(RPO|RTO|recovery point objective|recovery time objective)\b[^.;]{{0,40}}?"
                         rf"(?:of|is|:|=|within|under|less than|up to)?\s*{_NUM}\s*(minute|min|hour|hr|day)s?", I)
@@ -123,7 +130,7 @@ def _frequencies(sentence: str) -> list[Frequency]:
             if not anchors or min(abs(m.start() - a) for a in anchors) > 80:
                 continue
             before = sentence[max(0, m.start() - 30):m.start()]
-            if _NOT_BACKUP_SCHEDULE.search(before):
+            if _NOT_BACKUP_SCHEDULE.search(before) or _SCHEDULE_OF_TEST.search(sentence[m.end():m.end() + 40]):
                 continue
             if cls is None:  # every N <unit>
                 n = _n(m.group(1)) if m.lastindex and m.lastindex >= 2 else 1

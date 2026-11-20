@@ -8,7 +8,9 @@ from sqlalchemy import select, text
 from sqlalchemy.exc import IntegrityError
 
 from cyber_risk_intelligence.backup.__main__ import derive
+from cyber_risk_intelligence.backup.caiq import read_caiq
 from cyber_risk_intelligence.backup.parse import read_backup_statement
+from cyber_risk_intelligence.backup.star import CsaStarJob
 from cyber_risk_intelligence.collectors.trust_center import TrustCenterJob
 from cyber_risk_intelligence.collectors.trust_center.fetch import FetchResult
 from cyber_risk_intelligence.evidence import LocalStore
@@ -18,6 +20,7 @@ from cyber_risk_intelligence.models.backup import BackupPolicyClaim
 from cyber_risk_intelligence.quality import run_validation
 
 from . import factories as f
+from .docmaker import make_xlsx
 
 PAGE_URL = "https://trust.acme.example/resilience"
 PAGE = b"""<html><head><title>Acme Resilience</title></head><body><main>
@@ -64,6 +67,16 @@ def test_test_and_review_schedules_are_not_backup_frequencies():
     assert read_backup_statement("Our disaster recovery plan is tested annually.") is None
     assert freqs("Data is backed up nightly and restore tests are performed quarterly.") == [("daily", 1440)]
     assert freqs("Backups are tested monthly.") == []
+
+
+def test_wording_from_published_questionnaires():
+    st = read_backup_statement("Full backups are performed, at least, every seven days direct to disk and are retained "
+                               "for a minimum of fourteen (14) days, with differential backups taken every 24 hours.")
+    assert [(x.frequency_class, x.interval_minutes) for x in st.frequencies] == [("weekly", 10080), ("daily", 1440)]
+    assert st.retention_days == 14 and st.methods == ["full", "differential"]
+    assert freqs("Backup data validation is part of the monthly disaster recovery test.") == []
+    assert freqs("Backup activities can be monitored in real time.") == []
+    assert freqs("Duo backs up data stores housing customer sensitive data at least daily.") == [("daily", 1440)]
 
 
 def test_scope_keeps_product_features_and_customer_duties_apart():
@@ -179,3 +192,100 @@ def test_database_refuses_contradictions(session_factory, store, companies):
         with session_factory() as s, pytest.raises(IntegrityError):
             s.execute(text(sql))
             s.flush()
+
+
+# --- CSA STAR CAIQ self-assessments ---------------------------------------------------------------------
+
+CAIQ_URL = "https://cloudsecurityalliance.org/star/registry/acme/services/acme-cloud/download/AbC123"
+V4_HEADER = ["Question ID", "Question", "CSP CAIQ Answer", "SSRM Control Ownership",
+             "CSP Implementation Description (Optional/Recommended)", "CSC Responsibilities (Optional/Recommended)"]
+CAIQ_V4 = make_xlsx([
+    ["Consensus Assessments Initiative Questionnaire v4.0.2"],
+    V4_HEADER,
+    ["BCR-08.1", "Are backups performed periodically?", "Yes", "Shared CSP and CSC",
+     "Customer content is backed up daily and backups are retained for 30 days.", "Customers back up their own exports."],
+    ["BCR-08.2", "Is the confidentiality, integrity, and availability of the backup ensured?", "Yes", "CSP-owned",
+     "Backups are encrypted.", ""],
+    ["BCR-08.3", "Can backups be restored appropriately for resiliency?", "NA", "CSP-owned", "", ""],
+    ["BCR-09.1", "Is a disaster response plan established?", "Yes", "CSP-owned", "Tested annually.", ""],
+    ["DSP-19.1", "Are physical data locations, including where data is backed up, documented?", "Yes",
+     "CSP-owned", "Yes.", ""],
+], sheet_name="CAIQv4.0.2")
+CAIQ_V31 = make_xlsx([
+    ["Control Group", "CGID", "Question ID", "Control Specification", "Consensus Assessment Questions",
+     "Consensus Assessment Answers", "", "", "Notes"],
+    ["", "", "", "", "", "Yes", "No", "Not Applicable", ""],
+    ["BCR", "BCR-11", "BCR-11.4", "", "Do you have backup or redundancy mechanisms in place?", "", "x", "", ""],
+], sheet_name="CAIQ")
+
+
+def test_caiq_v4_backup_questions():
+    found = {a.question_id: a for a in read_caiq(CAIQ_V4)}
+    assert set(found) == {"BCR-08.1", "BCR-08.2", "BCR-08.3"}  # only business-continuity backup questions
+    assert (found["BCR-08.1"].answer, found["BCR-08.3"].answer) == ("yes", "na")
+    assert found["BCR-08.1"].ownership == "Shared CSP and CSC"
+    assert found["BCR-08.1"].customer_part == "Customers back up their own exports."
+
+
+def test_caiq_v31_marked_answers():
+    (a,) = read_caiq(CAIQ_V31)
+    assert (a.question_id, a.answer) == ("BCR-11.4", "no")
+
+
+def test_not_a_caiq_gives_nothing():
+    assert read_caiq(make_xlsx([["Name", "Value"], ["backups", "daily"]])) == []
+
+
+class StarFetcher:
+    def __init__(self, content):
+        self.content, self.urls = content, []
+
+    def fetch(self, url):
+        self.urls.append(url)
+        return FetchResult("captured", url, url, 200,
+                           "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", self.content)
+
+
+def star_csv(*rows):
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(["company_key", "service_name", "service_url", "caiq_url"])
+    w.writerows(rows)
+    return buf.getvalue().encode()
+
+
+def import_star(sf, store, content=CAIQ_V4, url=CAIQ_URL):
+    job = CsaStarJob(store, StarFetcher(content))
+    return run_import(sf, store, job, star_csv(["acme", "Acme Cloud", "", url]), source_url="file:///star.csv")
+
+
+def test_star_import_records_caiq_answers(session_factory, store, companies):
+    assert import_star(session_factory, store).status == "succeeded"
+    star = [r for r in rows(session_factory) if r.basis == "csa_star_caiq"]
+    by_q = {(r.caiq_question_id, r.frequency_class): r for r in star}
+    assert set(by_q) == {("BCR-08.1", "daily"), ("BCR-08.2", None)}  # NA answer gives no row
+    daily = by_q["BCR-08.1", "daily"]
+    assert (daily.interval_minutes, daily.retention_days, daily.scope) == (1440, 30, "own_practice")
+    assert daily.source_ref == CAIQ_URL and daily.claim_id is None and daily.verification_status == "claimed"
+    assert daily.service_name == "Acme Cloud" and daily.control_ownership == "Shared CSP and CSC"
+    assert daily.quote.startswith("BCR-08.1 Are backups performed periodically? Answer: Yes.")
+    with session_factory() as s:
+        (src,) = s.execute(text("SELECT sources FROM company_backup_frequencies WHERE frequency_class = 'daily'")).one()
+    assert src == "csa_star_caiq"
+    assert import_star(session_factory, store).rows_unchanged == 1  # repeat import adds nothing
+
+
+def test_star_no_answer_and_customer_owned(session_factory, store, companies):
+    customer = make_xlsx([V4_HEADER, ["BCR-08.1", "Are backups performed periodically?", "Yes", "CSC-owned",
+                                      "Customers schedule their own backups.", ""]])
+    import_star(session_factory, store, CAIQ_V31)
+    import_star(session_factory, store, customer, CAIQ_URL.replace("AbC123", "Xyz789"))
+    star = {r.caiq_question_id: r for r in rows(session_factory) if r.basis == "csa_star_caiq"}
+    assert star["BCR-11.4"].assertion == "negated" and star["BCR-11.4"].caiq_answer == "no"
+    assert star["BCR-08.1"].scope == "customer_responsibility"  # the customer's job is not the provider's practice
+
+
+def test_star_rejects_links_off_the_registry(session_factory, store, companies):
+    run = import_star(session_factory, store, url="https://acme.example/caiq.xlsx")
+    assert run.rows_rejected == 1
+    assert not [r for r in rows(session_factory) if r.basis == "csa_star_caiq"]
