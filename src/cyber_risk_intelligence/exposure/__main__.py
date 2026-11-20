@@ -33,26 +33,28 @@ def summary(sf) -> None:
             f"FROM ({LATEST}) l JOIN companies c ON c.id = l.company_id ORDER BY c.company_key, l.host")).all()
     per: dict[str, dict] = {}
     for r in rows:
-        p = per.setdefault(r.company_key, {"ips": set(), "attr": Counter(), "failed": 0, "vulns": 0, "sensitive": set()})
+        p = per.setdefault(r.company_key, {"ips": set(), "attr": {}, "failed": 0, "vulns": 0, "sensitive": set()})
         if r.outcome in ("dns_failed", "lookup_failed"):
             p["failed"] += 1
         if r.ip:
             p["ips"].add(r.ip)
         if r.attribution:
-            p["attr"][r.attribution] += 1
+            p["attr"].setdefault(r.attribution, set()).add(r.ip)  # an IP behind two hosts counts once
         if r.attribution in ("company_only", "unknown"):
             p["vulns"] = max(p["vulns"], r.vulns)
             if r.sensitive:
                 p["sensitive"].update(f"{r.ip}:{x}" for x in r.sensitive.split())
-    print(f"{'company':36} {'IPs':>4} {'cdn':>4} {'shared':>6} {'own?':>5} {'failed':>6} {'CVEs*':>5}  sensitive ports*")
+    print(f"{'company':36} {'IPs':>4} {'cdn':>4} {'shared':>6} {'own*':>5} {'failed':>6} {'CVEs*':>5}  sensitive ports*")
     for key, p in per.items():
-        own = p["attr"]["company_only"] + p["attr"]["unknown"]
-        print(f"{key:36} {len(p['ips']):>4} {p['attr']['cdn']:>4} {p['attr']['shared']:>6} {own:>5} {p['failed']:>6} "
-              f"{p['vulns']:>5}  {' '.join(sorted(p['sensitive']))[:70]}")
-    tally = Counter(r.attribution or r.outcome for r in rows)
-    print(", ".join(f"{k}: {v}" for k, v in tally.most_common()) or "no lookups yet")
-    print("* only IPs that are not a CDN or shared host (own? = company_only or no host name known). "
-          "Indexed by Shodan, not verified; CVEs are inferred from software versions.")
+        n = {a: len(p["attr"].get(a, ())) for a in ("cdn", "shared", "company_only", "unknown")}
+        print(f"{key:36} {len(p['ips']):>4} {n['cdn']:>4} {n['shared']:>6} {n['company_only'] + n['unknown']:>5} "
+              f"{p['failed']:>6} {p['vulns']:>5}  {' '.join(sorted(p['sensitive']))[:70]}")
+    tally = Counter(r.attribution or r.outcome for r in {(r.ip or r.host, r.attribution, r.outcome): r
+                                                        for r in rows}.values())
+    print("distinct IPs: " + (", ".join(f"{k}: {v}" for k, v in tally.most_common()) or "no lookups yet"))
+    print("IPs, cdn, shared and own count distinct IPs; failed counts lookups. * own = not a CDN or shared host "
+          "(company_only, or no host name known); CVEs = most potential CVEs on one own IP; sensitive ports are on "
+          "own IPs. Indexed by Shodan, not verified; CVEs are inferred from software versions.")
 
 
 def main(argv=None) -> int:

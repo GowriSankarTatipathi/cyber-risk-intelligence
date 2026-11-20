@@ -139,6 +139,13 @@ def test_job_records_lookups_ports_and_attribution(session_factory, store, acme,
     assert run.rows_unchanged == 1
 
 
+def test_summary_counts_an_ip_behind_two_hosts_once(session_factory, store, acme, capsys):
+    collect(session_factory, store, {"acme.example": ["198.51.100.1"], "www.acme.example": ["198.51.100.1"]}, DB)
+    summary(session_factory)
+    line = capsys.readouterr().out.split("\n")[1].split()
+    assert line[:4] == ["acme", "1", "1", "0"]  # 1 IP, 1 cdn (not 2), 0 shared
+
+
 def test_not_indexed_and_failures_are_kept_apart(session_factory, store, acme):
     run, _ = collect(session_factory, store, {"acme.example": ["192.0.2.10"], "www.acme.example": None},
                      {"192.0.2.10": httpx.ConnectTimeout("timed out")})
