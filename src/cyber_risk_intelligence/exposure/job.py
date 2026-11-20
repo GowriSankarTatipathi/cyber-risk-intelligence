@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 
 from ..ct.website import hosts_for
 from ..email_security.job import _TxtJob
@@ -46,6 +46,7 @@ INTERNETDB_SOURCE = SourceSpec(
           "own scans. Free, no key. Indexed data, not verification; no scan date given.",
 )
 MAX_IPS_PER_HOST = 8
+OWN_ATTRIBUTIONS = ("company_only", "unknown")
 
 
 def _within(name: str, domains: set[str]) -> bool:
@@ -108,6 +109,24 @@ class IndexedExposureJob(_TxtJob):
             return "inserted"
         return "unchanged" if "unchanged" in statuses else "updated"
 
+    @staticmethod
+    def _other_company(s, base: dict, ip: str) -> bool:
+        """Whether another company's host pointed to this IP earlier in the run. If so the IP serves
+        more than one organization (a shared cloud front end), so it is no one's own: the earlier rows
+        are marked ``shared`` too, and the caller marks this one."""
+        others = s.scalars(select(IndexedHostLookup.id).where(
+            IndexedHostLookup.ingestion_run_id == base["ingestion_run_id"], IndexedHostLookup.ip == ip,
+            IndexedHostLookup.company_id != base["company_id"])).all()
+        if not others:
+            return False
+        s.execute(update(IndexedHostLookup).where(IndexedHostLookup.id.in_(others),
+                                                  IndexedHostLookup.attribution.in_(OWN_ATTRIBUTIONS))
+                  .values(attribution="shared"))
+        s.execute(update(IndexedServiceObservation).where(IndexedServiceObservation.lookup_id.in_(others),
+                                                          IndexedServiceObservation.attribution.in_(OWN_ATTRIBUTIONS))
+                  .values(attribution="shared"))
+        return True
+
     def _lookup(self, s, base: dict, ip: str, own: set[str]) -> RowStatus:
         rec = self._record(ip)
         row = IndexedHostLookup(**base, ip=ip, outcome=rec.outcome, message=rec.message)
@@ -125,7 +144,9 @@ class IndexedExposureJob(_TxtJob):
             raise RowRejected("withheld", f"InternetDB answer for {ip} not stored: {exc}", "domain") from None
         d = rec.data or {}
         row.evidence_version_id = version.id
-        row.attribution = attribution(d, own)
+        row.attribution = attribution(d, own, ip)
+        if row.attribution in OWN_ATTRIBUTIONS and self._other_company(s, base, ip):
+            row.attribution = "shared"
         row.tags, row.hostnames = sorted(d.get("tags") or []) or None, sorted(d.get("hostnames") or []) or None
         row.cpes, row.potential_vulns = sorted(d.get("cpes") or []) or None, sorted(d.get("vulns") or []) or None
         s.add(row)

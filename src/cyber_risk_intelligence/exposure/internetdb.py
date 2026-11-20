@@ -11,6 +11,7 @@ version string, and an IP behind a CDN or shared host says nothing about the com
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
 import time
@@ -34,6 +35,29 @@ SERVICE_HINTS = {
 # Remote administration, file sharing and databases: services that should rarely face the internet.
 SENSITIVE_PORTS = frozenset({21, 23, 111, 135, 139, 161, 389, 445, 873, 1433, 1521, 1723, 2049, 2375, 3306,
                              3389, 5432, 5900, 5985, 5986, 6379, 9200, 11211, 27017})
+
+# Networks of mail and collaboration services that host thousands of companies on the same IPs, so
+# an IP inside them is never the company's own even when Shodan knows no host name for it.
+# Microsoft 365 / Exchange Online and Exchange Online Protection, from Microsoft's published
+# "Microsoft 365 URLs and IP address ranges" (Exchange Online endpoint sets).
+SHARED_SERVICE_NETWORKS = tuple(ipaddress.ip_network(n) for n in (
+    "13.107.6.152/31", "13.107.18.10/31", "13.107.128.0/22", "23.103.160.0/20", "40.92.0.0/15",
+    "40.96.0.0/13", "40.104.0.0/15", "40.107.0.0/16", "52.96.0.0/14", "52.100.0.0/14", "52.238.78.88/32",
+    "104.47.0.0/17", "131.253.33.215/32", "132.245.0.0/16", "150.171.32.0/22", "204.79.197.215/32",
+    "2603:1006::/40", "2603:1016::/36", "2603:1026::/36", "2603:1036::/36", "2603:1046::/36",
+    "2603:1056::/36", "2620:1ec:4::152/128", "2620:1ec:4::153/128", "2620:1ec:c::10/128",
+    "2620:1ec:c::11/128", "2620:1ec:d::10/128", "2620:1ec:d::11/128", "2620:1ec:8f0::/46",
+    "2620:1ec:900::/46", "2620:1ec:a92::152/128", "2620:1ec:a92::153/128", "2a01:111:f400::/48",
+    "2a01:111:f403::/48",
+))
+
+
+def in_shared_service(ip: str | None) -> bool:
+    try:
+        addr = ipaddress.ip_address(ip) if ip else None
+    except ValueError:
+        return False
+    return bool(addr) and any(addr.version == n.version and addr in n for n in SHARED_SERVICE_NETWORKS)
 
 
 @dataclass
@@ -88,18 +112,22 @@ def _registered(name: str) -> str:
     return organizational_domain(name.lower().rstrip("."))
 
 
-def attribution(data: dict, company_domains: set[str]) -> str:
+def attribution(data: dict, company_domains: set[str], ip: str | None = None) -> str:
     """How far the IP can be tied to the company, from InternetDB's own tags and host names:
 
     * ``cdn``: Shodan tags it as a CDN; the ports are the CDN's, not the company's.
+    * ``shared``: it also serves other organizations' names (shared hosting or a cloud load balancer),
+      or it is in a mail/collaboration service's network (``SHARED_SERVICE_NETWORKS``, e.g.
+      Microsoft 365). The job also marks an IP shared when two companies' hosts point to it.
     * ``company_only``: every host name Shodan knows for it is under one of the company's domains.
-    * ``shared``: it also serves other organizations' names (shared hosting or a cloud load balancer).
     * ``unknown``: Shodan knows no host name for it.
 
     Even ``company_only`` doesn't prove ownership; it only means nothing points elsewhere.
     """
     if "cdn" in (data.get("tags") or []):
         return "cdn"
+    if in_shared_service(ip):
+        return "shared"
     names = [h for h in data.get("hostnames") or [] if h]
     if not names:
         return "unknown"

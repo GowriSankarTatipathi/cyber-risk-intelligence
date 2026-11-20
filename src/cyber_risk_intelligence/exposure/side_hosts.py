@@ -39,12 +39,19 @@ HINTS: dict[str, tuple[int, frozenset[str]]] = {
                                   "test", "staging", "stage", "uat", "qa", "sandbox", "api", "grafana", "kibana"})),
 }
 NAME_HINTS = tuple(HINTS)
+# "gateway" / "gw" next to one of these words is an API, payment or telemetry gateway, not a way in
+# for people (apple-pay-gateway, graphql-gateway, otlp-gateway, llm-gateway ...).
+_SERVICE_GATEWAY = frozenset({"api", "apis", "pay", "payment", "payments", "graphql", "otlp", "telemetry", "llm",
+                              "ai", "mcp", "oblivious", "partner", "subscriptions", "ingest", "ingestor",
+                              "commerce", "ecommerce", "grpc", "webhook", "webhooks", "event", "events"})
 _SPLIT = re.compile(r"[.\-_0-9]+")
 
 
 def name_hint(hostname: str, domain: str) -> str | None:
     """The kind of service a name's own labels suggest (``vpn2.eu.acme.com`` -> remote_access), or None."""
     words = set(_SPLIT.split(hostname.lower().removesuffix("." + domain)))
+    if words & _SERVICE_GATEWAY:
+        words -= {"gateway", "gw"}
     best = max(((w, kind) for kind, (w, names) in HINTS.items() if words & names), default=None)
     return best[1] if best else None
 

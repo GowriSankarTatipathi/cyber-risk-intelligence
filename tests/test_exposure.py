@@ -251,3 +251,44 @@ def test_side_hosts_after_a_real_ct_collect(session_factory, store, acme, capsys
     run_import(session_factory, store, job, csv_bytes(["company_key", "domain"], ["acme", "acme.example"]),
                source_url="file:///t.csv")
     assert (job.side_hosts_asked, job.domains_with_side_hosts) == (1, 1)
+
+
+def test_microsoft_365_ips_are_shared():
+    assert attribution({"hostnames": []}, OWN, "52.96.223.8") == "shared"  # autodiscover on Exchange Online
+    assert attribution({"hostnames": []}, OWN, "2603:1036:302::1") == "shared"
+    assert attribution({"hostnames": []}, OWN, "192.0.2.10") == "unknown"
+    assert attribution({"hostnames": [], "tags": ["cdn"]}, OWN, "52.96.0.1") == "cdn"
+
+
+def test_api_and_payment_gateways_are_not_remote_access():
+    from cyber_risk_intelligence.exposure.side_hosts import name_hint
+
+    assert name_hint("apple-pay-gateway-pr-pod1.apple.com", "apple.com") is None
+    assert name_hint("otlp-gateway.api-business.comcast.com", "comcast.com") == "development"  # "api"
+    assert name_hint("graphql-gateway.dev.americantower.com", "americantower.com") == "development"
+    assert name_hint("gateway.amgen.com", "amgen.com") == "remote_access"
+    assert name_hint("kr1.gw.connect.aig.com", "aig.com") == "remote_access"
+    assert name_hint("api-gw.vpn.acme.example", "acme.example") == "remote_access"  # vpn still counts
+
+
+def test_ip_used_by_two_companies_is_shared(session_factory, store, acme):
+    with session_factory() as s:
+        f.company(s, "globex", "Globex")
+        s.commit()
+    assert run_import(session_factory, store, CompanyDomainsJob(), csv_bytes(
+        ["company_key", "domain", "role", "source_url"],
+        ["globex", "globex.example", "primary_website", "https://www.wikidata.org/entity/Q2"]),
+        source_url="file:///d2.csv").status == "succeeded"
+    dns = {"acme.example": ["192.0.2.50"], "globex.example": ["192.0.2.50"], "www.globex.example": ["192.0.2.60"]}
+    db = {"192.0.2.50": (200, {"ip": "192.0.2.50", "ports": [443, 3389], "hostnames": [], "tags": []}),
+          "192.0.2.60": (200, {"ip": "192.0.2.60", "ports": [443], "hostnames": [], "tags": []})}
+    run = run_import(session_factory, store, IndexedExposureJob(store, FakeResolver(dns), client(db)),
+                     csv_bytes(["company_key", "domain"], ["acme", "acme.example"], ["globex", "globex.example"]),
+                     source_url="file:///t.csv")
+    assert run.status == "succeeded"
+    with session_factory() as s:
+        found = {(r.host, r.attribution) for r in s.scalars(select(IndexedHostLookup).where(
+            IndexedHostLookup.outcome == "found"))}
+        ports = {(str(p.ip), p.attribution) for p in s.scalars(select(IndexedServiceObservation))}
+    assert found == {("acme.example", "shared"), ("globex.example", "shared"), ("www.globex.example", "unknown")}
+    assert ports == {("192.0.2.50", "shared"), ("192.0.2.60", "unknown")}
