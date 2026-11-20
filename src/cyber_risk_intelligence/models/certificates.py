@@ -15,8 +15,11 @@
   host that exists. A name is tied to a known domain (``domain_id``) only when
   it is that domain or under it; company links come from ``company_domains``.
 
-Nothing here contacts the hosts. Names are read from public logs only; no host
-is resolved, connected to or scanned.
+* ``website_certificate_checks``: the certificate the company's own website presents (its known domain
+  and ``www.`` host, one TLS handshake each), as a browser shows it under Inspect > Security.
+
+The CT tables come from public logs only; no host named in a certificate is resolved, connected to or
+scanned. The website check contacts only the company's known website, like visiting its home page.
 """
 
 from datetime import datetime
@@ -32,6 +35,7 @@ from sqlalchemy import (
     UniqueConstraint,
     func,
 )
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
 from .base import Base, IdMixin, in_list
@@ -146,4 +150,53 @@ class CertificateHostname(IdMixin, Base):
         CheckConstraint("is_wildcard = (hostname LIKE '*.%')", name="wildcard_flag"),
         CheckConstraint("base_name = CASE WHEN is_wildcard THEN substr(hostname, 3) ELSE hostname END",
                         name="base_name"),
+    )
+
+
+WEBSITE_TLS_OUTCOMES = (
+    "trusted",      # the certificate verified against the system's trusted roots and matched the host name
+    "not_trusted",  # a certificate was presented but did not verify (expired, wrong name, unknown issuer...)
+    "unreachable",  # no TLS answer (no such host, refused, timeout): says nothing about the certificate
+)
+
+
+class WebsiteCertificateCheck(IdMixin, Base):
+    """The certificate a company's own website presents, as a browser would see it (Inspect > Security).
+
+    Only the company's known domain and its ``www`` host are asked, one TLS handshake each on port 443;
+    no other host or port is contacted and none of the names inside the certificate is followed."""
+
+    __tablename__ = "website_certificate_checks"
+
+    domain_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("domains.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    host: Mapped[str] = mapped_column(Text, nullable=False, index=True)
+    port: Mapped[int] = mapped_column(Integer, nullable=False, server_default="443")
+    checked_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    outcome: Mapped[str] = mapped_column(Text, nullable=False)
+    message: Mapped[str | None] = mapped_column(Text)  # why it was not trusted / unreachable
+    tls_version: Mapped[str | None] = mapped_column(Text)
+    cert_sha256: Mapped[str | None] = mapped_column(Text, index=True)
+    serial_number: Mapped[str | None] = mapped_column(Text)
+    issuer_name: Mapped[str | None] = mapped_column(Text)
+    subject_name: Mapped[str | None] = mapped_column(Text)
+    common_name: Mapped[str | None] = mapped_column(Text)
+    names: Mapped[list | None] = mapped_column(JSONB(none_as_null=True))  # subjectAltName DNS names
+    not_before: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    not_after: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    evidence_version_id: Mapped[int | None] = mapped_column(
+        BigInteger, ForeignKey("evidence_versions.id", ondelete="RESTRICT"), index=True
+    )
+    ingestion_run_id: Mapped[int | None] = mapped_column(
+        BigInteger, ForeignKey("ingestion_runs.id", ondelete="SET NULL"), index=True
+    )
+
+    __table_args__ = (
+        CheckConstraint(in_list("outcome", WEBSITE_TLS_OUTCOMES), name="outcome"),
+        CheckConstraint("(outcome = 'unreachable') = (cert_sha256 IS NULL)", name="certificate_unless_unreachable"),
+        CheckConstraint("(outcome = 'unreachable') = (evidence_version_id IS NULL)", name="evidence_unless_unreachable"),
+        CheckConstraint("cert_sha256 IS NULL OR cert_sha256 ~ '^[0-9a-f]{64}$'", name="cert_sha256_hex"),
+        CheckConstraint("serial_number IS NULL OR serial_number ~ '^[0-9a-f]+$'", name="serial_number_hex"),
+        CheckConstraint("port BETWEEN 1 AND 65535", name="port"),
     )
