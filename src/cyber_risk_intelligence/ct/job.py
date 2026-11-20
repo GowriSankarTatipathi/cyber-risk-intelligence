@@ -1,9 +1,9 @@
 """Collect certificates and hostnames for company domains from Certificate Transparency (issue 10.1).
 
 Input is a CSV ``company_key,domain`` (``python -m cyber_risk_intelligence.ct targets`` writes one
-from ``company_domains``). For each row the job searches Cert Spotter for the domain and its
-subdomains (current certificates only, every page), falling back to crt.sh if Cert Spotter can't
-answer, stores the answer as evidence, and records:
+from ``company_domains``). For each row the job searches the crt.sh database for the domain and its
+subdomains (current certificates only), falling back to Cert Spotter and then the crt.sh web search
+if it can't answer, stores the answer as evidence, and records:
 
 * the search in ``ct_lookups`` (a failed search is ``lookup_failed``, never "no certificates");
 * each certificate once in ``certificates`` (TBS hash or issuer + serial number), however many entries,
@@ -47,6 +47,7 @@ from ..models.certificates import (
 )
 from .certspotter import CertSpotterClient
 from .crtsh import CrtShClient
+from .crtsh_db import CrtShDbClient
 from .entries import CtEntry, CtLookupResult
 
 CT_SOURCES = {
@@ -95,7 +96,8 @@ class CtJob(Job):
     )
 
     def __init__(self, store: ObjectStore, clients: list | None = None, defer: bool = False):
-        """``clients`` are tried in order until one answers (default: Cert Spotter, then crt.sh).
+        """``clients`` are tried in order until one answers (default: the crt.sh database, Cert Spotter,
+        then the crt.sh web search).
 
         With ``defer``, a domain that would have to wait for a rate limit is not recorded but added to
         ``deferred`` (``company_key``, ``domain``) to run afterwards, so small domains all finish first.
@@ -109,7 +111,7 @@ class CtJob(Job):
     @property
     def clients(self) -> list:
         if self._clients is None:
-            self._clients = [CertSpotterClient(), CrtShClient()]
+            self._clients = [CrtShDbClient(), CertSpotterClient(), CrtShClient()]
         for client in self._clients:
             if hasattr(client, "defer_on_limit"):
                 client.defer_on_limit = self.defer
@@ -226,7 +228,13 @@ class CtJob(Job):
         by_key: dict[tuple[str, str], list[CtEntry]] = {}
         for e in entries:
             by_key.setdefault(e.key, []).append(e)
-        ids = self._existing(s, list(by_key))
+        # A certificate stored earlier under its other identity (TBS hash from Cert Spotter or the crt.sh
+        # database, issuer + serial from the crt.sh web search) is the same certificate: match either one.
+        serial_of = {k: ("serial", f"{g[0].issuer_name}\x1f{g[0].serial_number}") for k, g in by_key.items()
+                     if k[0] == "tbs" and g[0].serial_number}
+        found = self._existing(s, [*by_key, *serial_of.values()])
+        ids = {k: found.get(k) or found.get(serial_of.get(k)) for k in by_key}
+        ids = {k: v for k, v in ids.items() if v}
         new_keys = [k for k in by_key if k not in ids]
         for i in range(0, len(new_keys), _CHUNK):
             chunk = new_keys[i:i + _CHUNK]
