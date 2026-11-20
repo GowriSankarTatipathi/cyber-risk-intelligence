@@ -1,6 +1,7 @@
 """Command line for issue 10.1.
 
     python -m cyber_risk_intelligence.ct collect    # search CT logs for every known company domain
+        # (newest certificate per host name; add --all-certificates to keep every current one)
     python -m cyber_risk_intelligence.ct targets    # print the company_key,domain list it uses
     python -m cyber_risk_intelligence.ct summary    # per company domain: latest search, certificates, hostnames
     python -m cyber_risk_intelligence.ct website    # the certificate each company website presents (domain and www.)
@@ -22,6 +23,9 @@ from sqlalchemy import text
 from ..db import make_engine, make_session_factory
 from ..evidence import store_from_env
 from ..ingest import run_import
+from .certspotter import CertSpotterClient
+from .crtsh import CrtShClient
+from .crtsh_db import CrtShDbClient
 from .job import CtJob, targets_csv
 from .website import WebsiteCertificateJob
 
@@ -66,6 +70,9 @@ def website_summary(sf) -> None:
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(prog="python -m cyber_risk_intelligence.ct")
     p.add_argument("command", choices=("collect", "targets", "summary", "website", "website-summary"))
+    p.add_argument("--all-certificates", action="store_true",
+                   help="collect: keep every current certificate from the crt.sh database, not only the newest "
+                        "one for each host name")
     args = p.parse_args(argv)
     sf = make_session_factory(make_engine())
     if args.command == "targets":
@@ -87,7 +94,9 @@ def main(argv=None) -> int:
               f"{r.rows_unchanged} same as last time, {r.rows_updated} unreachable, {r.rows_rejected} rejected")
         website_summary(sf)
         return 0 if r.status == "succeeded" else 2
-    quick = CtJob(store, defer=True)
+    clients = ([CrtShDbClient(latest_per_name=False), CertSpotterClient(), CrtShClient()]
+               if args.all_certificates else None)
+    quick = CtJob(store, clients=clients, defer=True)
     r = run_import(sf, store, quick, content, source_url="db:company_domains")
     report(r, len(quick.deferred))
     ok = r.status == "succeeded"
