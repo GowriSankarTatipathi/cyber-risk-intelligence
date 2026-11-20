@@ -116,7 +116,13 @@ def read_certificate(der: bytes) -> CertificateFacts:
 
 
 def hosts_for(domain: str) -> list[str]:
-    return [domain] if domain.startswith("www.") else [domain, f"www.{domain}"]
+    """The domain, plus ``www.`` for a registered domain (acme.com). A subdomain such as
+    corporate.acme.com is asked as it is: www.corporate.acme.com is rarely a real host."""
+    from ..email_security.dmarc import organizational_domain
+
+    if domain.startswith("www.") or organizational_domain(domain) != domain:
+        return [domain]
+    return [domain, f"www.{domain}"]
 
 
 class WebsiteCertificateJob(Job):
