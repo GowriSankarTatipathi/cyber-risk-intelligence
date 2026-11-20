@@ -199,3 +199,17 @@ def test_job_records_each_host(session_factory, store, acme):
     assert run.rows_unchanged == 1
     with session_factory() as s:
         assert len(s.scalars(select(WebsiteCertificateCheck)).all()) == 4
+
+
+def test_summary_leaves_out_hosts_no_longer_asked(session_factory, store, acme, capsys):
+    from cyber_risk_intelligence.ct.__main__ import website_summary
+
+    gone = TlsResult("www.acme.example", 443, "unreachable", "gaierror")
+    run_job(session_factory, store, {"acme.example": TlsResult("acme.example", 443, "unreachable", "timeout"),
+                                     "www.acme.example": gone})
+    with session_factory() as s:  # a later run that asked only the domain itself
+        s.execute(text("UPDATE website_certificate_checks SET ingestion_run_id = NULL WHERE host = 'www.acme.example'"))
+        s.commit()
+    website_summary(session_factory)
+    out = capsys.readouterr().out
+    assert "acme.example" in out and "www.acme.example" not in out
