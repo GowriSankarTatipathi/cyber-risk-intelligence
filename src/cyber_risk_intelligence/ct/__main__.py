@@ -1,11 +1,11 @@
 """Command line for issue 10.1.
 
-    python -m cyber_risk_intelligence.ct collect    # search crt.sh for every known company domain
+    python -m cyber_risk_intelligence.ct collect    # search CT logs for every known company domain
     python -m cyber_risk_intelligence.ct targets    # print the company_key,domain list it uses
     python -m cyber_risk_intelligence.ct summary    # per company domain: latest search, certificates, hostnames
 
 Or run on your own list:  python -m cyber_risk_intelligence.ingest run ct targets.csv
-crt.sh is a free shared service: one search every few seconds, so 200 domains take a while.
+Cert Spotter answers 100 certificates per page in well under a second; crt.sh is the fallback.
 """
 
 import argparse
