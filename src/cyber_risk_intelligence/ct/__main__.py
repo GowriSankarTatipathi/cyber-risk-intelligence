@@ -51,7 +51,11 @@ def website_summary(sf) -> None:
             "AS issuer, "
             "w.not_after::date AS expires, (w.not_after::date - current_date) AS days_left "
             "FROM latest_website_certificates w JOIN company_domains cd ON cd.domain_id = w.domain_id "
-            "AND cd.valid_to IS NULL JOIN companies c ON c.id = cd.company_id ORDER BY c.company_key, w.host")).all()
+            "AND cd.valid_to IS NULL JOIN companies c ON c.id = cd.company_id "
+            # only hosts asked in the domain's latest run, so a host no longer asked drops out
+            "WHERE w.ingestion_run_id IS NOT DISTINCT FROM (SELECT max(x.ingestion_run_id) "
+            "FROM website_certificate_checks x WHERE x.domain_id = w.domain_id) "
+            "ORDER BY c.company_key, w.host")).all()
     print(f"{'company':32} {'host':34} {'outcome':12} {'issuer':28} {'expires':10} {'days':>5}")
     for r in rows:
         print(f"{r.company_key:32} {r.host:34} {r.outcome:12} {r.issuer[:28]:28} {r.expires or ''!s:10} "
