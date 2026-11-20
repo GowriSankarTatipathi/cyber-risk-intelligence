@@ -1,7 +1,8 @@
 """Look up each company host's IPs in Shodan InternetDB (issue 10.3).
 
 Hosts asked, per company domain: the website hosts (the domain, plus ``www.`` for a registered
-domain) and the domain's MX hosts that sit under one of the company's own domains. A mail host run
+domain), the domain's MX hosts that sit under one of the company's own domains, and (``side_hosts``)
+up to that many side hosts named in the company's CT certificates (see ``side_hosts``). A mail host run
 by a provider (Microsoft, Proofpoint, Google ...) is skipped: its IPs serve thousands of companies.
 Each host is resolved through public DNS (A records); each IP is then looked up in InternetDB, once
 per run. Nothing is sent to the hosts or IPs themselves.
@@ -34,6 +35,7 @@ from .internetdb import (
     InternetDbClient,
     attribution,
 )
+from .side_hosts import side_hosts
 
 INTERNETDB_SOURCE = SourceSpec(
     source_key=SOURCE,
@@ -55,9 +57,11 @@ class IndexedExposureJob(_TxtJob):
     name = "indexed_exposure"
     dataset_key = "indexed_exposure_targets"
 
-    def __init__(self, store: ObjectStore, resolver=None, client: InternetDbClient | None = None):
+    def __init__(self, store: ObjectStore, resolver=None, client: InternetDbClient | None = None,
+                 side_hosts: int = 0):
         super().__init__(store, resolver)
         self._client = client
+        self.side_hosts = side_hosts
         self._seen: dict[str, HostRecord] = {}  # one InternetDB lookup per IP per run
 
     @property
@@ -76,15 +80,17 @@ class IndexedExposureJob(_TxtJob):
         s = ctx.session
         own = set(s.scalars(select(Domain.name).join(CompanyDomain, CompanyDomain.domain_id == Domain.id).where(
             CompanyDomain.company_id == company.id, CompanyDomain.valid_to.is_(None))).all()) | {domain.name}
-        hosts = [(h, "website") for h in hosts_for(domain.name)]
+        hosts = [(h, "website", None) for h in hosts_for(domain.name)]
         mx = getattr(self.resolver, "mx", None)
-        hosts += [(m, "mail") for m in (mx(domain.name) or [] if mx else []) if _within(m, own)
-                  and m not in {h for h, _ in hosts}]
+        hosts += [(m, "mail", None) for m in (mx(domain.name) or [] if mx else []) if _within(m, own)
+                  and m not in {h for h, _, _ in hosts}]
+        hosts += [(h, "certificate_name", hint) for h, hint in
+                  side_hosts(s, domain.id, domain.name, self.side_hosts, {h for h, _, _ in hosts})]
         statuses = []
-        for host, role in hosts:
+        for host, role, hint in hosts:
             ips = self.resolver.a(host)
             now = datetime.now(UTC)
-            base = {"company_id": company.id, "domain_id": domain.id, "host": host, "host_role": role,
+            base = {"company_id": company.id, "domain_id": domain.id, "host": host, "host_role": role, "name_hint": hint,
                     "source": SOURCE, "retrieved_at": now, "ingestion_run_id": ctx.run.id}
             if not ips:
                 s.add(IndexedHostLookup(**base, outcome="dns_failed" if ips is None else "no_address",
