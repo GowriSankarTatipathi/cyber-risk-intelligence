@@ -1,11 +1,12 @@
 """Collect certificates and hostnames for company domains from Certificate Transparency (issue 10.1).
 
 Input is a CSV ``company_key,domain`` (``python -m cyber_risk_intelligence.ct targets`` writes one
-from ``company_domains``). For each row the job searches crt.sh once for the domain and its
-subdomains (current certificates only), stores the answer as evidence, and records:
+from ``company_domains``). For each row the job searches Cert Spotter for the domain and its
+subdomains (current certificates only, every page), falling back to crt.sh if Cert Spotter can't
+answer, stores the answer as evidence, and records:
 
 * the search in ``ct_lookups`` (a failed search is ``lookup_failed``, never "no certificates");
-* each certificate once in ``certificates`` (issuer + serial number), however many log entries,
+* each certificate once in ``certificates`` (TBS hash or issuer + serial number), however many entries,
   searches or domains it turns up in, with every sighting in ``certificate_observations``;
 * the names it covers in ``certificate_hostnames``. Wildcards are kept and flagged. A name is tied
   to a known domain only when it is that domain or a subdomain of it.
@@ -16,10 +17,11 @@ Passive only: no host named in a certificate is resolved, contacted or scanned.
 from __future__ import annotations
 
 import csv
+import gzip
 import io
 from datetime import UTC, datetime
 
-from sqlalchemy import select, tuple_
+from sqlalchemy import insert, select, tuple_, update
 
 from ..domains import normalize_domain
 from ..evidence import SecretDetected, record_evidence
@@ -41,16 +43,28 @@ from ..models.certificates import (
     CertificateObservation,
     CtLookup,
 )
-from .crtsh import CrtShClient, CtEntry
+from .certspotter import CertSpotterClient
+from .crtsh import CrtShClient
+from .entries import CtEntry, CtLookupResult
 
-CT_SOURCE = SourceSpec(
-    source_key="crt_sh",
-    name="crt.sh Certificate Transparency log search",
-    source_type="other",
-    access_method="api",
-    base_url="https://crt.sh/",
-    notes="Public index of Certificate Transparency logs (Sectigo). Free shared service; queries are spaced out.",
-)
+CT_SOURCES = {
+    "certspotter": SourceSpec(
+        source_key="certspotter",
+        name="Cert Spotter (SSLMate) Certificate Transparency search API",
+        source_type="other",
+        access_method="api",
+        base_url="https://api.certspotter.com/v1/issuances",
+        notes="Public CT search API; current certificates, 100 per page. Optional API key from CERTSPOTTER_API_KEY.",
+    ),
+    "crt.sh": SourceSpec(
+        source_key="crt_sh",
+        name="crt.sh Certificate Transparency log search",
+        source_type="other",
+        access_method="api",
+        base_url="https://crt.sh/",
+        notes="Public index of Certificate Transparency logs (Sectigo). Free shared service; used as a fallback.",
+    ),
+}
 _CHUNK = 500
 
 
@@ -76,15 +90,28 @@ class CtJob(Job):
              else f"{r.get('domain')!r} is not a domain name", field="domain"),
     )
 
-    def __init__(self, store: ObjectStore, client: CrtShClient | None = None):
+    def __init__(self, store: ObjectStore, clients: list | None = None):
+        """``clients`` are tried in order until one answers (default: Cert Spotter, then crt.sh)."""
         self.store = store
-        self._client = client
+        self._clients = clients
 
     @property
-    def client(self) -> CrtShClient:
-        if self._client is None:
-            self._client = CrtShClient()
-        return self._client
+    def clients(self) -> list:
+        if self._clients is None:
+            self._clients = [CertSpotterClient(), CrtShClient()]
+        return self._clients
+
+    def search(self, name: str) -> CtLookupResult:
+        failures = []
+        for client in self.clients:
+            result = client.search(name)
+            if result.outcome != "lookup_failed":
+                if failures:
+                    result.message = "; ".join([*failures, *([result.message] if result.message else [])])
+                return result
+            failures.append(f"{result.source}: {result.message}")
+        result.message = "; ".join(failures)
+        return result
 
     def parse(self, content: bytes):
         reader = csv.DictReader(io.StringIO(content.decode("utf-8-sig")))
@@ -106,67 +133,91 @@ class CtJob(Job):
             raise RowRejected("domain_not_linked", f"{name} is not a known domain of {r['company_key']}; "
                                                    "import it with company-domains first", "domain")
 
-        result = self.client.search(name)
+        result = self.search(name)
         now = datetime.now(UTC)
-        lookup = CtLookup(domain_id=domain.id, query=name, source="crt.sh", request_url=result.request_url,
+        lookup = CtLookup(domain_id=domain.id, query=name, source=result.source, request_url=result.request_url,
                           queried_at=now, outcome=result.outcome, http_status=result.http_status,
-                          message=result.message, ingestion_run_id=ctx.run.id)
+                          message=result.message, pages=result.pages, complete=result.complete,
+                          ingestion_run_id=ctx.run.id)
         if result.outcome == "lookup_failed":
             s.add(lookup)
             s.flush()
             return "updated"
         try:
-            version = record_evidence(s, self.store, source=ensure_source(s, CT_SOURCE),
-                                      source_url=result.request_url, content=result.content,
-                                      media_type="application/json", http_status=result.http_status,
-                                      title=f"crt.sh certificates for {name}")
+            # Gzipped JSON: a big estate's answer is hundreds of MB as text and about a tenth compressed.
+            # mtime=0 keeps the bytes identical for an identical answer, so repeat runs reuse the stored copy.
+            version = record_evidence(s, self.store, source=ensure_source(s, CT_SOURCES[result.source]),
+                                      source_url=result.request_url, content=gzip.compress(result.content, mtime=0),
+                                      media_type="application/gzip", http_status=result.http_status,
+                                      title=f"{result.source} certificates for {name} (gzipped JSON)")
         except SecretDetected as exc:
-            raise RowRejected("withheld", f"crt.sh answer for {name} not stored: {exc}", "domain") from None
+            raise RowRejected("withheld", f"{result.source} answer for {name} not stored: {exc}", "domain") from None
         lookup.evidence_version_id = version.id
         lookup.entry_count = len(result.entries)
-        lookup.certificate_count = len({(e.issuer_name, e.serial_number) for e in result.entries})
+        lookup.certificate_count = len({e.key for e in result.entries})
         s.add(lookup)
         s.flush()
         new = self._store_entries(s, lookup, version.id, result.entries, now)
         return "inserted" if new else "unchanged"
 
+    @staticmethod
+    def _existing(s, keys: list[tuple[str, str]]) -> dict[tuple[str, str], int]:
+        """certificate key -> id for the keys already stored."""
+        found: dict[tuple[str, str], int] = {}
+        tbs = [v for k, v in keys if k == "tbs"]
+        serials = [tuple(v.split("\x1f", 1)) for k, v in keys if k == "serial"]
+        for i in range(0, len(tbs), _CHUNK):
+            for cid, h in s.execute(select(Certificate.id, Certificate.tbs_sha256)
+                                    .where(Certificate.tbs_sha256.in_(tbs[i:i + _CHUNK]))):
+                found[("tbs", h)] = cid
+        for i in range(0, len(serials), _CHUNK):
+            for cid, issuer, serial in s.execute(select(Certificate.id, Certificate.issuer_name, Certificate.serial_number)
+                                                 .where(tuple_(Certificate.issuer_name, Certificate.serial_number)
+                                                        .in_(serials[i:i + _CHUNK]))):
+                found[("serial", f"{issuer}\x1f{serial}")] = cid
+        return found
+
     def _store_entries(self, s, lookup: CtLookup, version_id: int, entries: list[CtEntry], now: datetime) -> int:
+        """Bulk writes: tens of thousands of certificates for one domain must not mean as many round trips."""
         by_key: dict[tuple[str, str], list[CtEntry]] = {}
         for e in entries:
-            by_key.setdefault((e.issuer_name, e.serial_number), []).append(e)
-        keys = list(by_key)
-        existing: dict[tuple[str, str], Certificate] = {}
-        for i in range(0, len(keys), _CHUNK):
-            chunk = keys[i:i + _CHUNK]
-            for c in s.scalars(select(Certificate).where(
-                    tuple_(Certificate.issuer_name, Certificate.serial_number).in_(chunk))):
-                existing[(c.issuer_name, c.serial_number)] = c
+            by_key.setdefault(e.key, []).append(e)
+        ids = self._existing(s, list(by_key))
+        new_keys = [k for k in by_key if k not in ids]
+        for i in range(0, len(new_keys), _CHUNK):
+            chunk = new_keys[i:i + _CHUNK]
+            rows = []
+            for k in chunk:
+                e = by_key[k][0]
+                rows.append({"issuer_name": e.issuer_name, "issuer_ca_id": e.issuer_ca_id,
+                             "serial_number": e.serial_number, "tbs_sha256": e.tbs_sha256,
+                             "cert_sha256": e.cert_sha256, "revoked": e.revoked, "common_name": e.common_name,
+                             "not_before": e.not_before, "not_after": e.not_after,
+                             "first_observed_at": now, "last_observed_at": now})
+            created = s.execute(insert(Certificate).returning(Certificate.id, sort_by_parameter_order=True), rows)
+            for k, cid in zip(chunk, created.scalars(), strict=True):
+                ids[k] = cid
+        fresh = set(new_keys)
+        old = [ids[k] for k in by_key if k not in fresh]
+        for i in range(0, len(old), _CHUNK):
+            s.execute(update(Certificate).where(Certificate.id.in_(old[i:i + _CHUNK]))
+                      .values(last_observed_at=now))
+
         domains = self._domains_for(s, {n.removeprefix("*.") for e in entries for n in e.names})
-        new = 0
-        for key, group in by_key.items():
-            cert = existing.get(key)
-            if cert is None:
-                first = group[0]
-                cert = Certificate(issuer_name=first.issuer_name, issuer_ca_id=first.issuer_ca_id,
-                                   serial_number=first.serial_number, common_name=first.common_name,
-                                   not_before=first.not_before, not_after=first.not_after,
-                                   first_observed_at=now, last_observed_at=now)
-                s.add(cert)
-                s.flush()
-                names = list(dict.fromkeys(n for e in group for n in e.names))
-                for n in names:
-                    base = n.removeprefix("*.")
-                    s.add(CertificateHostname(certificate_id=cert.id, hostname=n, is_wildcard=n.startswith("*."),
-                                              base_name=base, domain_id=domains.get(base)))
-                new += 1
-            else:
-                cert.last_observed_at = max(cert.last_observed_at, now)
-            for e in group:
-                s.add(CertificateObservation(certificate_id=cert.id, ct_lookup_id=lookup.id,
-                                             log_entry_id=e.log_entry_id, evidence_version_id=version_id,
-                                             observed_at=now, source_ref=f"https://crt.sh/?id={e.log_entry_id}"))
+        names = []
+        for k in new_keys:
+            for n in dict.fromkeys(n for e in by_key[k] for n in e.names):
+                base = n.removeprefix("*.")
+                names.append({"certificate_id": ids[k], "hostname": n, "is_wildcard": n.startswith("*."),
+                              "base_name": base, "domain_id": domains.get(base)})
+        observations = [{"certificate_id": ids[k], "ct_lookup_id": lookup.id, "source_entry_id": e.entry_id,
+                         "evidence_version_id": version_id, "observed_at": now, "source_ref": e.source_ref}
+                        for k, group in by_key.items() for e in group]
+        for model, rows in ((CertificateHostname, names), (CertificateObservation, observations)):
+            for i in range(0, len(rows), 5000):
+                s.execute(insert(model), rows[i:i + 5000])
         s.flush()
-        return new
+        return len(new_keys)
 
     @staticmethod
     def _domains_for(s, names: set[str]) -> dict[str, int]:

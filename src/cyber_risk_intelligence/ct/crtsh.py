@@ -14,68 +14,26 @@ import json
 import os
 import re
 import time
-from dataclasses import dataclass, field
-from datetime import UTC, datetime
 from urllib.parse import urlencode
 
 import httpx
 
+from .entries import (
+    DEFAULT_USER_AGENT,
+    CtEntry,
+    CtLookupResult,
+    clean_name,
+    names_of,
+    when,
+)
+
 BASE_URL = "https://crt.sh/"
 MAX_BYTES = 64 * 1024 * 1024
-DEFAULT_USER_AGENT = "cyber-risk-intelligence/0.1 (passive CT lookup)"
-_HOST_LABEL = re.compile(r"^(?!-)[a-z0-9_-]{1,63}(?<!-)$")
-
-
-@dataclass
-class CtEntry:
-    """One log entry as the index reports it (a precertificate and its certificate are two entries)."""
-
-    log_entry_id: int
-    issuer_name: str
-    issuer_ca_id: int | None
-    serial_number: str
-    common_name: str | None
-    not_before: datetime | None
-    not_after: datetime | None
-    names: list[str]  # valid DNS names (lower-case), wildcards included
-
-
-@dataclass
-class CtLookupResult:
-    outcome: str  # answered / no_results / lookup_failed
-    request_url: str
-    http_status: int | None = None
-    message: str | None = None
-    content: bytes | None = None
-    entries: list[CtEntry] = field(default_factory=list)
+__all__ = ["CrtShClient", "clean_name", "parse_entries", "request_url"]
 
 
 def request_url(domain: str) -> str:
     return BASE_URL + "?" + urlencode({"q": domain, "output": "json", "exclude": "expired"})
-
-
-def _when(value) -> datetime | None:
-    if not value:
-        return None
-    try:
-        dt = datetime.fromisoformat(str(value))
-    except ValueError:
-        return None
-    return dt if dt.tzinfo else dt.replace(tzinfo=UTC)  # crt.sh gives UTC without an offset
-
-
-def clean_name(value: str) -> str | None:
-    """A DNS name from a certificate, lower-case, or None for e-mail addresses, IPs and junk."""
-    v = (value or "").strip().lower().rstrip(".")
-    if not v or "@" in v or " " in v or "/" in v or ":" in v:
-        return None
-    labels = v.split(".")
-    if len(labels) < 2 or labels[-1].isdigit():
-        return None
-    first = 1 if labels[0] == "*" else 0
-    if not all(_HOST_LABEL.match(x) for x in labels[first:]):
-        return None
-    return v
 
 
 def parse_entries(content: bytes) -> list[CtEntry]:
@@ -89,15 +47,18 @@ def parse_entries(content: bytes) -> list[CtEntry]:
         issuer = (row.get("issuer_name") or "").strip()
         if not serial or not issuer or row.get("id") is None:
             continue
-        raw = [*str(row.get("name_value") or "").split("\n"), str(row.get("common_name") or "")]
-        names = list(dict.fromkeys(n for n in (clean_name(x) for x in raw) if n))
-        cn = (row.get("common_name") or "").strip() or None
-        entries.append(CtEntry(int(row["id"]), issuer, row.get("issuer_ca_id"), serial, cn,
-                               _when(row.get("not_before")), _when(row.get("not_after")), names))
+        names = names_of([*str(row.get("name_value") or "").split("\n"), str(row.get("common_name") or "")])
+        entries.append(CtEntry(
+            entry_id=str(row["id"]), source_ref=f"https://crt.sh/?id={row['id']}", issuer_name=issuer, names=names,
+            serial_number=serial, issuer_ca_id=row.get("issuer_ca_id"),
+            common_name=(row.get("common_name") or "").strip() or None,
+            not_before=when(row.get("not_before")), not_after=when(row.get("not_after"))))
     return entries
 
 
 class CrtShClient:
+    source = "crt.sh"
+
     def __init__(self, client: httpx.Client | None = None, min_delay: float = 5.0, retries: int = 3,
                  backoff: float = 10.0, timeout: float = 180.0):
         agent = os.environ.get("COLLECTOR_USER_AGENT") or DEFAULT_USER_AGENT
@@ -117,14 +78,14 @@ class CrtShClient:
             self._wait(self.min_delay - (time.monotonic() - self._last))
             self._last = time.monotonic()
             try:
-                body = b""
+                body = bytearray()
                 with self.client.stream("GET", url) as r:
                     last_status = r.status_code
                     if r.status_code == 200:
                         for chunk in r.iter_bytes():
                             body += chunk
                             if len(body) > MAX_BYTES:
-                                return CtLookupResult("lookup_failed", url, 200,
+                                return CtLookupResult("crt.sh", "lookup_failed", url, 200,
                                                       f"answer larger than {MAX_BYTES // (1024 * 1024)} MB; "
                                                       "too many certificates to read in one search")
                     retry_after = r.headers.get("Retry-After")
@@ -134,7 +95,8 @@ class CrtShClient:
                     except (ValueError, TypeError) as exc:
                         last_message = f"unreadable answer: {exc}"
                     else:
-                        return CtLookupResult("answered" if entries else "no_results", url, 200, None, body, entries)
+                        return CtLookupResult("crt.sh", "answered" if entries else "no_results", url, 200, None,
+                                              bytes(body), entries, pages=1)
                 elif r.status_code in (429, 500, 502, 503, 504):
                     last_message = f"HTTP {r.status_code}"
                     if attempt < self.retries:
@@ -142,10 +104,10 @@ class CrtShClient:
                         self._wait(pause)
                     continue
                 else:
-                    return CtLookupResult("lookup_failed", url, r.status_code, f"HTTP {r.status_code}")
+                    return CtLookupResult("crt.sh", "lookup_failed", url, r.status_code, f"HTTP {r.status_code}")
             except httpx.HTTPError as exc:
                 last_message = f"{type(exc).__name__}: {exc}"
             if attempt < self.retries:
                 self._wait(self.backoff * (attempt + 1))
-        return CtLookupResult("lookup_failed", url, last_status,
+        return CtLookupResult("crt.sh", "lookup_failed", url, last_status,
                               f"{last_message} (after {self.retries + 1} attempts)")

@@ -1,11 +1,12 @@
 """Issue 10.1: certificates and hostnames from public Certificate Transparency logs.
 
-* ``ct_lookups``: one row per search of a CT log index (crt.sh) for a company
+* ``ct_lookups``: one row per search of a CT log index (Cert Spotter, or crt.sh as a fallback) for a company
   domain: what was asked, when, how it ended, and the stored response. A failed
   search (``lookup_failed``) says nothing about which certificates exist.
-* ``certificates``: one row per certificate, identified by issuer and serial
-  number, so the precertificate and the final certificate (two log entries)
-  and repeat searches collapse to one stable record.
+* ``certificates``: one row per certificate, identified by the SHA-256 of its
+  to-be-signed part (Cert Spotter) or by issuer and serial number (crt.sh), so
+  the precertificate and the final certificate and repeat searches collapse to
+  one stable record.
 * ``certificate_observations``: each time a lookup saw a certificate, with the
   log index's own entry id. This keeps the source observations behind each
   certificate.
@@ -35,7 +36,7 @@ from sqlalchemy.orm import Mapped, mapped_column
 
 from .base import Base, IdMixin, in_list
 
-CT_SOURCES = ("crt.sh",)
+CT_SOURCES = ("certspotter", "crt.sh")
 CT_OUTCOMES = (
     "answered",       # the index answered with at least one certificate
     "no_results",     # the index answered: no current certificate names this domain
@@ -56,7 +57,10 @@ class CtLookup(IdMixin, Base):
     outcome: Mapped[str] = mapped_column(Text, nullable=False)
     http_status: Mapped[int | None] = mapped_column(Integer)
     message: Mapped[str | None] = mapped_column(Text)
-    entry_count: Mapped[int | None] = mapped_column(Integer)  # log entries returned
+    entry_count: Mapped[int | None] = mapped_column(Integer)  # entries returned
+    pages: Mapped[int | None] = mapped_column(Integer)  # pages read (Cert Spotter returns 100 per page)
+    # False when the search stopped early (page limit, or a page failed after retries): what was read is kept.
+    complete: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="true")
     certificate_count: Mapped[int | None] = mapped_column(Integer)  # distinct certificates among them
     evidence_version_id: Mapped[int | None] = mapped_column(
         BigInteger, ForeignKey("evidence_versions.id", ondelete="RESTRICT"), index=True
@@ -72,6 +76,7 @@ class CtLookup(IdMixin, Base):
         CheckConstraint("(outcome = 'lookup_failed') = (entry_count IS NULL)", name="count_unless_failed"),
         CheckConstraint("(outcome = 'no_results') = (entry_count = 0)", name="no_results_means_zero"),
         CheckConstraint("entry_count IS NULL OR entry_count >= 0", name="entry_count"),
+        CheckConstraint("complete OR outcome = 'answered'", name="incomplete_only_when_answered"),
     )
 
 
@@ -80,7 +85,10 @@ class Certificate(IdMixin, Base):
 
     issuer_name: Mapped[str] = mapped_column(Text, nullable=False)
     issuer_ca_id: Mapped[int | None] = mapped_column(BigInteger)  # crt.sh CA id
-    serial_number: Mapped[str] = mapped_column(Text, nullable=False)  # lower-case hex
+    serial_number: Mapped[str | None] = mapped_column(Text)  # lower-case hex (crt.sh)
+    tbs_sha256: Mapped[str | None] = mapped_column(Text, unique=True)  # Cert Spotter certificate identity
+    cert_sha256: Mapped[str | None] = mapped_column(Text)
+    revoked: Mapped[bool | None] = mapped_column(Boolean)  # as the index reported it; NULL = not reported
     common_name: Mapped[str | None] = mapped_column(Text)
     not_before: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     not_after: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -89,8 +97,10 @@ class Certificate(IdMixin, Base):
 
     __table_args__ = (
         UniqueConstraint("issuer_name", "serial_number", name="uq_certificates_issuer_serial"),
-        CheckConstraint("serial_number = lower(serial_number) AND serial_number ~ '^[0-9a-f]+$'",
-                        name="serial_number_hex"),
+        CheckConstraint("serial_number IS NULL OR (serial_number = lower(serial_number) "
+                        "AND serial_number ~ '^[0-9a-f]+$')", name="serial_number_hex"),
+        CheckConstraint("tbs_sha256 IS NULL OR tbs_sha256 ~ '^[0-9a-f]{64}$'", name="tbs_sha256_hex"),
+        CheckConstraint("serial_number IS NOT NULL OR tbs_sha256 IS NOT NULL", name="has_identity"),
         CheckConstraint("not_after IS NULL OR not_before IS NULL OR not_after >= not_before", name="validity"),
         CheckConstraint("last_observed_at >= first_observed_at", name="observed_dates"),
     )
@@ -105,15 +115,15 @@ class CertificateObservation(IdMixin, Base):
     ct_lookup_id: Mapped[int] = mapped_column(
         BigInteger, ForeignKey("ct_lookups.id", ondelete="CASCADE"), nullable=False, index=True
     )
-    log_entry_id: Mapped[int] = mapped_column(BigInteger, nullable=False)  # crt.sh certificate id
+    source_entry_id: Mapped[str] = mapped_column(Text, nullable=False)  # the index's id for this entry
     evidence_version_id: Mapped[int] = mapped_column(
         BigInteger, ForeignKey("evidence_versions.id", ondelete="RESTRICT"), nullable=False, index=True
     )
     observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
-    source_ref: Mapped[str] = mapped_column(Text, nullable=False)  # link to the log entry
+    source_ref: Mapped[str] = mapped_column(Text, nullable=False)  # public link to the certificate
 
     __table_args__ = (
-        UniqueConstraint("ct_lookup_id", "log_entry_id", name="uq_certificate_observations_lookup_entry"),
+        UniqueConstraint("ct_lookup_id", "source_entry_id", name="uq_certificate_observations_lookup_entry"),
     )
 
 

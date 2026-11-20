@@ -10,6 +10,7 @@ from sqlalchemy import func, select, text
 from sqlalchemy.exc import IntegrityError
 
 from cyber_risk_intelligence.ct import CtJob
+from cyber_risk_intelligence.ct.certspotter import CertSpotterClient
 from cyber_risk_intelligence.ct.crtsh import CrtShClient, clean_name, parse_entries
 from cyber_risk_intelligence.domains import CompanyDomainsJob
 from cyber_risk_intelligence.evidence import LocalStore
@@ -67,6 +68,30 @@ def crtsh(responses):
     return client, calls
 
 
+def spotter(pages_by_after, status_seq=None, max_pages=None):
+    """A CertSpotterClient answering from ``pages_by_after``: after-id ('' for the first page) -> items.
+    ``status_seq`` is a list of statuses to answer with first (e.g. [429])."""
+    calls, statuses = [], list(status_seq or [])
+
+    def handler(request):
+        after = request.url.params.get("after", "")
+        calls.append(after)
+        if statuses:
+            code = statuses.pop(0)
+            return httpx.Response(code, headers={"Retry-After": "0"}, content=b"{}")
+        return httpx.Response(200, content=json.dumps(pages_by_after.get(after, [])).encode())
+
+    client = CertSpotterClient(httpx.Client(transport=httpx.MockTransport(handler)), min_delay=0, retries=2,
+                               backoff=0, max_pages=max_pages)
+    return client, calls
+
+
+def issuance(id_, tbs_char, names, issuer="C=US, O=DigiCert Inc, CN=DigiCert Global G2 TLS RSA SHA256 2020 CA1"):
+    return {"id": str(id_), "tbs_sha256": tbs_char * 64, "cert_sha256": "c" * 63 + tbs_char, "dns_names": names,
+            "issuer": {"name": issuer}, "not_before": "2026-09-01T00:00:00Z", "not_after": "2027-09-01T23:59:59Z",
+            "revoked": False}
+
+
 @pytest.fixture
 def store(tmp_path):
     return LocalStore(tmp_path)
@@ -86,10 +111,10 @@ def acme(session_factory, store):
     assert run.status == "succeeded"
 
 
-def collect(sf, store, responses, *rows):
+def collect(sf, store, responses, *rows, clients=None):
     client, calls = crtsh(responses)
     rows = rows or (["acme", "acme.example"],)
-    run = run_import(sf, store, CtJob(store, client), csv_bytes(["company_key", "domain"], *rows),
+    run = run_import(sf, store, CtJob(store, clients or [client]), csv_bytes(["company_key", "domain"], *rows),
                      source_url="file:///t.csv")
     return run, calls
 
@@ -124,7 +149,7 @@ def test_certificates_collapse_and_keep_observations(session_factory, store, acm
         certs = s.scalars(select(Certificate).order_by(Certificate.id)).all()
         assert len(certs) == 3  # precertificate + certificate collapse to one
         obs = s.scalars(select(CertificateObservation)).all()
-        assert sorted(o.log_entry_id for o in obs) == [101, 102, 103, 104]
+        assert sorted(o.source_entry_id for o in obs) == ["101", "102", "103", "104"]
         assert all(o.evidence_version_id and o.source_ref.startswith("https://crt.sh/?id=") for o in obs)
         lookup = s.scalars(select(CtLookup)).one()
         assert (lookup.outcome, lookup.entry_count, lookup.certificate_count) == ("answered", 4, 3)
@@ -198,3 +223,54 @@ def test_database_refuses_inconsistent_rows(session_factory, store, acme):
         with session_factory() as s, pytest.raises(IntegrityError):
             s.execute(text(sql))
             s.flush()
+
+
+# --- Cert Spotter (first choice; pages through big domains) ----------------------------------------------
+
+PAGES = {"": [issuance(1, "a", ["acme.example", "www.acme.example"]), issuance(2, "b", ["*.cdn.acme.example"])],
+         "2": [issuance(3, "d", ["api.acme.example", "globex.example"])], "3": []}
+
+
+def test_certspotter_reads_every_page(session_factory, store, acme):
+    client, calls = spotter(PAGES)
+    run, _ = collect(session_factory, store, {}, clients=[client])
+    assert run.status == "succeeded" and calls == ["", "2", "3"]
+    with session_factory() as s:
+        lookup = s.scalars(select(CtLookup)).one()
+        certs = s.scalars(select(Certificate)).all()
+        obs = s.scalars(select(CertificateObservation)).all()
+    assert (lookup.source, lookup.pages, lookup.complete, lookup.certificate_count) == ("certspotter", 3, True, 3)
+    assert {c.tbs_sha256[0] for c in certs} == {"a", "b", "d"} and all(c.serial_number is None for c in certs)
+    assert all(o.source_ref.startswith("https://crt.sh/?sha256=") for o in obs)
+
+
+def test_certspotter_repeat_collapses_by_tbs(session_factory, store, acme):
+    for _ in range(2):
+        client, _ = spotter(PAGES)
+        collect(session_factory, store, {}, clients=[client])
+    assert count(session_factory, Certificate) == 3 and count(session_factory, CertificateObservation) == 6
+
+
+def test_certspotter_rate_limit_waits_and_continues(session_factory, store, acme):
+    client, calls = spotter(PAGES, status_seq=[429])
+    collect(session_factory, store, {}, clients=[client])
+    assert calls == ["", "", "2", "3"] and count(session_factory, Certificate) == 3
+
+
+def test_page_limit_keeps_what_was_read_and_says_so(session_factory, store, acme):
+    client, _ = spotter(PAGES, max_pages=1)
+    collect(session_factory, store, {}, clients=[client])
+    with session_factory() as s:
+        lookup = s.scalars(select(CtLookup)).one()
+    assert (lookup.outcome, lookup.complete, lookup.certificate_count) == ("answered", False, 2)
+    assert "more exist" in lookup.message
+
+
+def test_falls_back_to_crtsh_when_certspotter_fails(session_factory, store, acme):
+    failing, _ = spotter({}, status_seq=[503, 503, 503])
+    fallback, calls = crtsh({"acme.example": [(200, ACME)]})
+    collect(session_factory, store, {}, clients=[failing, fallback])
+    with session_factory() as s:
+        lookup = s.scalars(select(CtLookup)).one()
+    assert lookup.source == "crt.sh" and calls == ["acme.example"] and "certspotter: HTTP 503" in lookup.message
+    assert count(session_factory, Certificate) == 3
