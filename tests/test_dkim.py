@@ -15,6 +15,7 @@ from cyber_risk_intelligence.email_security import (
     KnownSelector,
     TxtLookup,
     read_dkim,
+    selectors_from_mail_records,
     selectors_from_spf,
 )
 from cyber_risk_intelligence.email_security.__main__ import (
@@ -43,8 +44,11 @@ KEY = rsa_key()
 class FakeResolver:
     name = "fake-resolver"
 
-    def __init__(self, answers):
-        self.answers, self.calls = answers, []
+    def __init__(self, answers, mx=None):
+        self.answers, self.calls, self.mx_hosts = answers, [], mx or {}
+
+    def mx(self, name):
+        return self.mx_hosts.get(name, [])
 
     def txt(self, name):
         self.calls.append(name)
@@ -102,6 +106,27 @@ def test_spf_walk_stops_at_the_spf_lookup_limit():
     assert lookups == MAX_SPF_LOOKUPS and len(r.calls) == MAX_SPF_LOOKUPS
 
 
+def test_providers_shown_by_mx_or_verification_record():
+    # SPF names only a mail filter, but mail is delivered to Microsoft 365
+    r = FakeResolver({"acme.example": [["v=spf1 include:spf-001.pphosted.example -all"]]},
+                     mx={"acme.example": ["acme-example.mail.protection.outlook.com"]})
+    known = selectors_from_mail_records("acme.example", r.txt, r.mx)
+    assert [k.selector for k in known] == ["selector1", "selector2"]
+    assert known[0].source == "mail_provider" and "MX acme-example.mail.protection.outlook.com is Microsoft 365" \
+        in known[0].evidence
+    # Microsoft's domain verification record shows a Microsoft 365 tenant even behind a filter
+    r = FakeResolver({"acme.example": [["MS=ms12345678"], ["google-site-verification=abc"]]},
+                     mx={"acme.example": ["mx1.pphosted.example"]})
+    known = selectors_from_mail_records("acme.example", r.txt, r.mx)
+    assert [k.selector for k in known] == ["selector1", "selector2"] and "MS=ms12345678" in known[0].evidence
+    # Google Search Console verification says nothing about mail; MX at Google does
+    r = FakeResolver({"acme.example": [["google-site-verification=abc"]]})
+    assert selectors_from_mail_records("acme.example", r.txt, r.mx) == []
+    r = FakeResolver({}, mx={"acme.example": ["aspmx.l.google.com"]})
+    assert [k.selector for k in selectors_from_mail_records("acme.example", r.txt, r.mx)] == ["google"]
+    assert selectors_from_mail_records("acme.example", r.txt, lambda name: None) == []  # failed MX lookup
+
+
 def test_no_spf_or_unknown_provider_means_no_selector():
     assert selectors_from_spf("acme.example", FakeResolver({}).txt) == []
     r = FakeResolver({"acme.example": [["v=spf1 include:mail.unknown-vendor.example -all"]]})
@@ -135,8 +160,8 @@ def acme(session_factory, store):
     assert run.status == "succeeded"
 
 
-def collect(sf, store, answers, published=None):
-    resolver = FakeResolver(answers)
+def collect(sf, store, answers, published=None, mx=None):
+    resolver = FakeResolver(answers, mx)
     run = run_import(sf, store, DkimJob(store, resolver, published=published),
                      csv_bytes(["company_key", "domain"], ["acme", "acme.example"]), source_url="file:///t.csv")
     return run, resolver
@@ -187,6 +212,17 @@ def test_failed_lookup_is_kept_apart(session_factory, store, acme):
     with session_factory() as s:
         e = s.scalars(select(DkimEvidence).where(DkimEvidence.selector == "selector1")).one()
     assert (e.outcome, e.evidence_version_id, e.problem) == ("lookup_failed", None, "timed out")
+
+
+def test_key_found_through_mx_evidence(session_factory, store, acme, capsys):
+    collect(session_factory, store, {"acme.example": [["v=spf1 include:spf-001.pphosted.example -all"]],
+                                     "selector1._domainkey.acme.example": [[f"p={KEY}"]]},
+            mx={"acme.example": ["acme-example.mail.protection.outlook.com"]})
+    with session_factory() as s:
+        e = s.scalars(select(DkimEvidence).where(DkimEvidence.selector == "selector1")).one()
+    assert (e.outcome, e.selector_source) == ("key_found", "mail_provider")
+    dkim_summary(session_factory)
+    assert "Microsoft 365 (MX)" in capsys.readouterr().out
 
 
 def test_wildcard_txt_at_a_selector_is_not_a_key(session_factory, store, acme):

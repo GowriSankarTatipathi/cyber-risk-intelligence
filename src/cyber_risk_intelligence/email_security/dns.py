@@ -1,6 +1,6 @@
-"""Public DNS lookups (read-only TXT queries; nothing else is sent to the domain).
+"""Public DNS lookups (read-only TXT and MX queries; nothing else is sent to the domain).
 
-``DnsResolver`` wraps dnspython. Tests pass a fake with the same ``txt`` method.
+``DnsResolver`` wraps dnspython. Tests pass a fake with the same ``txt`` (and optionally ``mx``) method.
 The resolver used is recorded on every lookup: set ``DNS_RESOLVERS`` (comma
 separated IPs, e.g. ``1.1.1.1,8.8.8.8``) to choose one, otherwise the system's.
 """
@@ -59,3 +59,17 @@ class DnsResolver:
             return TxtLookup("no_records", self.name, rcode="NOERROR")
         records = [[s.decode("utf-8", "replace") for s in r.strings] for r in ans.rrset]
         return TxtLookup("answered", self.name, rcode="NOERROR", answers=records, ttl=ans.rrset.ttl)
+
+    def mx(self, name: str) -> list[str] | None:
+        """The mail exchanger host names of ``name`` (empty when none), or None when the lookup failed."""
+        import dns.exception
+        import dns.resolver
+
+        time.sleep(self.pause)
+        try:
+            ans = self._r.resolve(name, "MX", raise_on_no_answer=False)
+        except dns.resolver.NXDOMAIN:
+            return []
+        except dns.exception.DNSException:
+            return None
+        return [str(r.exchange).lower().rstrip(".") for r in ans.rrset] if ans.rrset is not None else []

@@ -159,7 +159,7 @@ DKIM_OUTCOMES = (
     "lookup_failed",      # timeout, SERVFAIL, network error: unknown
     "no_known_selector",  # no selector is known from public evidence: unknown, never "no DKIM"
 )
-DKIM_SELECTOR_SOURCES = ("spf_provider", "published")
+DKIM_SELECTOR_SOURCES = ("spf_provider", "mail_provider", "published")
 
 
 class DkimEvidence(IdMixin, Base):
