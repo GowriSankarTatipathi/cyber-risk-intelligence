@@ -2,6 +2,9 @@
 
     python -m cyber_risk_intelligence.backup derive    # read backup schedules out of what 1.1 already collected
     python -m cyber_risk_intelligence.backup summary   # per company: the schedules each company states
+
+CSA STAR CAIQ answers are imported with:
+    python -m cyber_risk_intelligence.ingest run csa-star csa_star_targets.csv
 """
 
 import argparse
@@ -28,13 +31,13 @@ def summary(sf) -> None:
     with sf() as s:
         rows = s.execute(text(
             "SELECT c.company_key, v.scope, coalesce(v.frequency_class, 'not stated') AS freq, "
-            "v.shortest_interval_minutes AS mins, v.statements, v.systems "
+            "v.shortest_interval_minutes AS mins, v.statements, v.sources, v.systems "
             "FROM company_backup_frequencies v JOIN companies c ON c.id = v.company_id "
             "ORDER BY c.company_key, v.scope, v.shortest_interval_minutes NULLS LAST")).all()
-    print(f"{'company':28} {'scope':24} {'frequency':12} {'minutes':>8} statements systems")
+    print(f"{'company':28} {'scope':24} {'frequency':12} {'minutes':>8} statements {'sources':31} systems")
     for r in rows:
         mins = "" if r.mins is None else str(r.mins)
-        print(f"{r.company_key:28} {r.scope:24} {r.freq:12} {mins:>8} {r.statements:10} {r.systems or ''}")
+        print(f"{r.company_key:28} {r.scope:24} {r.freq:12} {mins:>8} {r.statements:10} {r.sources:31} {r.systems or ''}")
     print(f"{len(rows)} company/scope/frequency rows")
 
 

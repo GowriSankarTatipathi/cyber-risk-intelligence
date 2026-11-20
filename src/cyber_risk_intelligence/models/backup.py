@@ -4,7 +4,9 @@
 about its backups: how often (``frequency_class`` and ``interval_minutes``),
 of what (``covered_system``), how (``methods``), kept how long
 (``retention_days``) and the recovery objectives (``rpo_minutes``,
-``rto_minutes``). Rows come from 1.1 ``backup_and_recovery`` claims.
+``rto_minutes``). Rows come from 1.1 ``backup_and_recovery`` claims
+(``basis = 'company_statement'``) and from the backup questions of the
+company's CSA STAR CAIQ self-assessment (``basis = 'csa_star_caiq'``).
 
 * A sentence about backups that gives no schedule is kept with
   ``frequency_class`` NULL: the frequency is unknown, not "none".
@@ -36,6 +38,10 @@ from ..backup.parse import FREQUENCY_CLASSES, METHODS, SCOPES
 from .base import Base, IdMixin, in_list
 
 ASSERTIONS = ("affirmed", "negated")
+# company_statement: a sentence on the company's own pages or documents (via 1.1).
+# csa_star_caiq: the company's answer in its CSA STAR CAIQ self-assessment, published on the CSA STAR Registry.
+BASES = ("company_statement", "csa_star_caiq")
+CAIQ_ANSWERS = ("yes", "no")
 
 
 class BackupPolicyClaim(IdMixin, Base):
@@ -58,6 +64,13 @@ class BackupPolicyClaim(IdMixin, Base):
     claim_hash: Mapped[str] = mapped_column(Text, nullable=False)
     section_heading: Mapped[str | None] = mapped_column(Text)
     assertion: Mapped[str] = mapped_column(Text, nullable=False, server_default="affirmed")
+    basis: Mapped[str] = mapped_column(Text, nullable=False, server_default="company_statement")
+    # CSA STAR rows: the CAIQ question (e.g. BCR-08.1), the yes/no answer, who owns the control under the
+    # shared-responsibility model, and the cloud service the questionnaire covers.
+    caiq_question_id: Mapped[str | None] = mapped_column(Text)
+    caiq_answer: Mapped[str | None] = mapped_column(Text)
+    control_ownership: Mapped[str | None] = mapped_column(Text)
+    service_name: Mapped[str | None] = mapped_column(Text)
 
     scope: Mapped[str] = mapped_column(Text, nullable=False)
     covered_system: Mapped[str | None] = mapped_column(Text)
@@ -80,6 +93,10 @@ class BackupPolicyClaim(IdMixin, Base):
                          name="uq_backup_policy_claims_statement", postgresql_nulls_not_distinct=True),
         CheckConstraint(in_list("scope", SCOPES), name="scope"),
         CheckConstraint(in_list("assertion", ASSERTIONS), name="assertion"),
+        CheckConstraint(in_list("basis", BASES), name="basis"),
+        CheckConstraint("(basis = 'csa_star_caiq') = (caiq_question_id IS NOT NULL)", name="caiq_question_id"),
+        CheckConstraint(f"caiq_answer IS NULL OR {in_list('caiq_answer', CAIQ_ANSWERS)}", name="caiq_answer"),
+        CheckConstraint("basis = 'company_statement' OR claim_id IS NULL", name="claim_only_for_statements"),
         CheckConstraint(f"frequency_class IS NULL OR {in_list('frequency_class', FREQUENCY_CLASSES)}",
                         name="frequency_class"),
         CheckConstraint("(frequency_class IS NULL) = (frequency_phrase IS NULL)", name="frequency_phrase"),
