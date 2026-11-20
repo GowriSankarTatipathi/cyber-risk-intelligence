@@ -62,6 +62,8 @@ class IndexedExposureJob(_TxtJob):
         super().__init__(store, resolver)
         self._client = client
         self.side_hosts = side_hosts
+        self.side_hosts_asked = 0  # how many side hosts were chosen this run, over how many domains
+        self.domains_with_side_hosts = 0
         self._seen: dict[str, HostRecord] = {}  # one InternetDB lookup per IP per run
 
     @property
@@ -84,8 +86,10 @@ class IndexedExposureJob(_TxtJob):
         mx = getattr(self.resolver, "mx", None)
         hosts += [(m, "mail", None) for m in (mx(domain.name) or [] if mx else []) if _within(m, own)
                   and m not in {h for h, _, _ in hosts}]
-        hosts += [(h, "certificate_name", hint) for h, hint in
-                  side_hosts(s, domain.id, domain.name, self.side_hosts, {h for h, _, _ in hosts})]
+        side = side_hosts(s, domain.id, domain.name, self.side_hosts, {h for h, _, _ in hosts})
+        self.side_hosts_asked += len(side)
+        self.domains_with_side_hosts += bool(side)
+        hosts += [(h, "certificate_name", hint) for h, hint in side]
         statuses = []
         for host, role, hint in hosts:
             ips = self.resolver.a(host)

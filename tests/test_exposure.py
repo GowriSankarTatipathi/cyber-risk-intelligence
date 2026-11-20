@@ -231,3 +231,23 @@ def test_side_hosts_come_from_recent_certificates(session_factory, store, acme, 
     summary(session_factory)
     out = capsys.readouterr().out
     assert "vpn.acme.example:3389/rdp" in out and "fortinet:fortios" in out
+
+
+def test_side_hosts_after_a_real_ct_collect(session_factory, store, acme, capsys):
+    """CT names stored by ct collect are picked up, and the plan says when there are none."""
+    from cyber_risk_intelligence.ct.job import CtJob
+    from cyber_risk_intelligence.exposure.__main__ import side_host_plan
+
+    from .test_ct import issuance, spotter
+
+    assert side_host_plan(session_factory, 40) == (0, 0)
+    assert "run  python -m cyber_risk_intelligence.ct collect" in capsys.readouterr().out
+    ct, _ = spotter({"": [issuance(1, "a", ["acme.example", "vpn.acme.example", "*.acme.example"])]})
+    run_import(session_factory, store, CtJob(store, [ct]), csv_bytes(["company_key", "domain"], ["acme", "acme.example"]),
+               source_url="file:///t.csv")
+    assert side_host_plan(session_factory, 40) == (1, 1)
+    assert "vpn" in capsys.readouterr().out
+    job = IndexedExposureJob(store, FakeResolver({"vpn.acme.example": ["192.0.2.30"]}), client({}), side_hosts=40)
+    run_import(session_factory, store, job, csv_bytes(["company_key", "domain"], ["acme", "acme.example"]),
+               source_url="file:///t.csv")
+    assert (job.side_hosts_asked, job.domains_with_side_hosts) == (1, 1)
