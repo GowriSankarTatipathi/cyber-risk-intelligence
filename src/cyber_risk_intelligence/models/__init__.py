@@ -22,7 +22,7 @@ from .certificates import (
     CtLookup,
     WebsiteCertificateCheck,
 )
-from .email_security import DnsSecurityRecord, EmailSecurityObservation
+from .email_security import DkimEvidence, DnsSecurityRecord, EmailSecurityObservation
 from .http_security import HttpSecurityCheck, HttpSecurityObservation
 from .evidence import EvidenceLink, EvidenceObject, EvidenceVersion, Source
 
@@ -33,6 +33,7 @@ __all__ = [
     "CtLookup",
     "WebsiteCertificateCheck",
     "BackupPolicyClaim",
+    "DkimEvidence",
     "DnsSecurityRecord",
     "HttpSecurityCheck",
     "HttpSecurityObservation",

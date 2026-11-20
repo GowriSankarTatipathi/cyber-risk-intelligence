@@ -1,14 +1,18 @@
-"""Command line for issues 23.1 and 23.2.
+"""Command line for issues 23.1, 23.2 and 23.3.
 
     python -m cyber_risk_intelligence.email_security spf       # look up SPF for every known company domain
     python -m cyber_risk_intelligence.email_security dmarc     # look up DMARC for every known company domain
+    python -m cyber_risk_intelligence.email_security dkim [--selectors published.csv]
+        # DKIM keys at selectors known from public evidence (SPF-named providers, plus the CSV:
+        # company_key,domain,selector,source_url)
     python -m cyber_risk_intelligence.email_security targets   # print the company_key,domain list they use
-    python -m cyber_risk_intelligence.email_security summary [spf|dmarc]   # latest result per domain
+    python -m cyber_risk_intelligence.email_security summary [spf|dmarc|dkim]   # latest result per domain
 
 Load domains first:  python -m cyber_risk_intelligence.ingest run company-domains company_domains.csv
 """
 
 import argparse
+import csv
 import sys
 from collections import Counter
 
@@ -17,7 +21,8 @@ from sqlalchemy import text
 from ..db import make_engine, make_session_factory
 from ..evidence import store_from_env
 from ..ingest import run_import
-from .job import DmarcJob, SpfJob, targets_csv
+from .dkim import KnownSelector
+from .job import DkimJob, DmarcJob, SpfJob, targets_csv
 
 
 def spf_summary(sf) -> None:
@@ -51,13 +56,50 @@ def dmarc_summary(sf) -> None:
     print(", ".join(f"p={k}: {v}" for k, v in Counter(r.p for r in rows if r.p).most_common()))
 
 
-JOBS = {"spf": (SpfJob, spf_summary), "dmarc": (DmarcJob, dmarc_summary)}
+def dkim_summary(sf) -> None:
+    with sf() as s:
+        rows = s.execute(text(
+            "WITH latest AS (SELECT e.*, max(e.ingestion_run_id) OVER (PARTITION BY e.domain_id) AS last_run "
+            "FROM dkim_evidence e) "
+            "SELECT c.company_key, d.name, coalesce(l.selector, '') AS sel, l.outcome, "
+            "coalesce(l.key_type || ' ' || l.key_bits, '') AS key, coalesce(l.problem, '') AS problem, "
+            "coalesce(substring(l.selector_evidence from 'authorizes ([^(]+) \\('), "
+            "CASE l.selector_source WHEN 'published' THEN 'published' END, '') AS via "
+            "FROM latest l JOIN domains d ON d.id = l.domain_id LEFT JOIN companies c ON c.id = l.company_id "
+            "WHERE l.ingestion_run_id IS NOT DISTINCT FROM l.last_run ORDER BY c.company_key, d.name, l.selector")).all()
+    print(f"{'company':36} {'domain':30} {'selector':12} {'outcome':18} {'key':10} via")
+    for r in rows:
+        print(f"{r.company_key or '':36} {r.name:30} {r.sel:12} {r.outcome:18} {r.key:10} {r.via.strip()} {r.problem[:50]}")
+    domains: dict = {}
+    for r in rows:
+        domains.setdefault(r.name, set()).add(r.outcome)
+    status = Counter("key found" if "key_found" in o else "no known selector" if o == {"no_known_selector"}
+                     else "unknown (no key at known selectors)" for o in domains.values())
+    print(", ".join(f"{k}: {v}" for k, v in status.most_common()) or "no DKIM lookups yet")
+
+
+def published_selectors(path: str) -> dict[tuple[str, str], list[KnownSelector]]:
+    """company_key,domain,selector,source_url rows: selectors seen in public sources."""
+    out: dict[tuple[str, str], list[KnownSelector]] = {}
+    with open(path, newline="", encoding="utf-8-sig") as fh:
+        for row in csv.DictReader(fh):
+            if not (row.get("selector") and row.get("source_url")):
+                continue  # a selector without a public source is not used
+            key = (row["company_key"].strip(), row["domain"].strip().lower())
+            out.setdefault(key, []).append(KnownSelector(row["selector"].strip(), "published",
+                                                         f"published at {row['source_url'].strip()}",
+                                                         row["source_url"].strip()))
+    return out
+
+
+JOBS = {"spf": (SpfJob, spf_summary), "dmarc": (DmarcJob, dmarc_summary), "dkim": (DkimJob, dkim_summary)}
 
 
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(prog="python -m cyber_risk_intelligence.email_security")
-    p.add_argument("command", choices=("spf", "dmarc", "targets", "summary"))
-    p.add_argument("control", nargs="?", choices=tuple(JOBS), default="spf", help="for summary: spf or dmarc")
+    p.add_argument("command", choices=("spf", "dmarc", "dkim", "targets", "summary"))
+    p.add_argument("control", nargs="?", choices=tuple(JOBS), default="spf", help="for summary: spf, dmarc or dkim")
+    p.add_argument("--selectors", help="dkim: CSV of company_key,domain,selector,source_url seen in public sources")
     args = p.parse_args(argv)
     sf = make_session_factory(make_engine())
     if args.command == "summary":
@@ -73,7 +115,9 @@ def main(argv=None) -> int:
         return 1
     store = store_from_env()
     job_cls, summary = JOBS[args.command]
-    r = run_import(sf, store, job_cls(store), content, source_url="db:company_domains")
+    job = (DkimJob(store, published=published_selectors(args.selectors) if args.selectors else None)
+           if job_cls is DkimJob else job_cls(store))
+    r = run_import(sf, store, job, content, source_url="db:company_domains")
     print(f"run {r.id} {r.status}: {r.rows_seen} domains, {r.rows_inserted} new answers, "
           f"{r.rows_unchanged} same as last time, {r.rows_rejected} rejected")
     summary(sf)
