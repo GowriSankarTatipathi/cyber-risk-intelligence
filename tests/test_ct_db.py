@@ -50,8 +50,6 @@ class FakeConnection:
         self.answers, self.log, self.closed, self.sql, self.columns = answers, log, False, [], columns
 
     def execute(self, sql, params=None):
-        if params is None:  # SET statement_timeout
-            return FakeCursor([])
         self.log.append((params["domain"], "x509_tbscert_strip_ct_ext" in sql))
         self.sql.append(sql)
         answer = self.answers[params["domain"]]

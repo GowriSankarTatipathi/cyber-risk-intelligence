@@ -8,7 +8,10 @@ domain with thousands of certificates answers in seconds, with no paging and no 
   validity and the names that match the domain. Each certificate also gets ``tbs_sha256``, the
   SHA-256 of its to-be-signed part with the CT extensions removed (``x509_tbscert_strip_ct_ext``), which
   is how Cert Spotter identifies a certificate, so one seen by both indexes is stored once.
-* The guest database is shared and sometimes refuses connections or cancels long queries. A failed
+* The guest database sits behind a connection pooler in statement mode: each query runs on its own,
+  outside any transaction, with its parameters bound on our side (no session settings, no
+  server-side prepared statements). It is shared and sometimes refuses connections or cancels long
+  queries. A failed
   query is ``lookup_failed`` (the job then asks Cert Spotter), never "no certificates".
 * Connecting goes to crt.sh's IPv4 addresses first (an IPv6 route that is advertised but broken is
   common on home networks), and is tried ``connect_attempts`` times with a growing pause. If it still
@@ -112,12 +115,11 @@ def to_entry(row: dict, with_common_name: bool = True) -> CtEntry | None:
 class CrtShDbClient:
     source = "crt.sh"  # the same index as the web search; request_url says it was asked through SQL
 
-    def __init__(self, connect=None, max_certs: int | None = None, statement_timeout_s: int = 300,
-                 connect_timeout_s: int = 15, latest_per_name: bool = True, connect_attempts: int = 3,
+    def __init__(self, connect=None, max_certs: int | None = None, connect_timeout_s: int = 15, latest_per_name: bool = True, connect_attempts: int = 3,
                  backoff_s: float = 5.0, retry_after_s: float = 300.0, max_outages: int = 3):
         self._connect = connect or self._psycopg_connect
         self.max_certs = max_certs or int(os.environ.get("CT_DB_MAX_CERTS") or 300_000)
-        self.statement_timeout_s, self.connect_timeout_s = statement_timeout_s, connect_timeout_s
+        self.connect_timeout_s = connect_timeout_s
         self.connect_attempts, self.backoff_s = connect_attempts, backoff_s
         self.retry_after_s, self.max_outages = retry_after_s, max_outages
         self._conn = None
@@ -148,7 +150,10 @@ class CrtShDbClient:
         for addr in self._addresses():
             extra = {"hostaddr": addr} if addr else {}
             try:
+                # crt.sh sits behind a pooler in statement mode: no transactions (autocommit), no
+                # server-side prepared statements, so parameters are bound on our side (ClientCursor).
                 return psycopg.connect(host=HOST, port=PORT, user=USER, dbname=DBNAME, autocommit=True,
+                                       prepare_threshold=None, cursor_factory=psycopg.ClientCursor,
                                        connect_timeout=self.connect_timeout_s,
                                        application_name="cyber-risk-intelligence", **extra)
             except psycopg.OperationalError as exc:
@@ -165,10 +170,6 @@ class CrtShDbClient:
                     if attempt + 1 >= self.connect_attempts:
                         raise
                     self._sleep(self.backoff_s * (attempt + 1))
-            try:
-                self._conn.execute(f"SET statement_timeout = '{int(self.statement_timeout_s)}s'")
-            except Exception as exc:  # noqa: BLE001 - the server's own limit applies then
-                log.debug("crt.sh database: statement_timeout not set: %s", exc)
         return self._conn
 
     def close(self) -> None:
