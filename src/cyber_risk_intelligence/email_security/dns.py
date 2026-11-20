@@ -1,4 +1,4 @@
-"""Public DNS lookups (read-only TXT and MX queries; nothing else is sent to the domain).
+"""Public DNS lookups (read-only TXT, MX and A queries; nothing else is sent to the domain).
 
 ``DnsResolver`` wraps dnspython. Tests pass a fake with the same ``txt`` (and optionally ``mx``) method.
 The resolver used is recorded on every lookup: set ``DNS_RESOLVERS`` (comma
@@ -73,3 +73,17 @@ class DnsResolver:
         except dns.exception.DNSException:
             return None
         return [str(r.exchange).lower().rstrip(".") for r in ans.rrset] if ans.rrset is not None else []
+
+    def a(self, name: str) -> list[str] | None:
+        """The IPv4 addresses ``name`` resolves to (empty when none), or None when the lookup failed."""
+        import dns.exception
+        import dns.resolver
+
+        time.sleep(self.pause)
+        try:
+            ans = self._r.resolve(name, "A", raise_on_no_answer=False)
+        except dns.resolver.NXDOMAIN:
+            return []
+        except dns.exception.DNSException:
+            return None
+        return sorted({r.address for r in ans.rrset}) if ans.rrset is not None else []

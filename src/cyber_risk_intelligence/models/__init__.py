@@ -30,6 +30,7 @@ from .email_security import (
     TlsReportingObservation,
 )
 from .http_security import HttpSecurityCheck, HttpSecurityObservation
+from .exposure import IndexedHostLookup, IndexedServiceObservation
 from .evidence import EvidenceLink, EvidenceObject, EvidenceVersion, Source
 
 __all__ = [
@@ -45,6 +46,8 @@ __all__ = [
     "TlsReportingObservation",
     "HttpSecurityCheck",
     "HttpSecurityObservation",
+    "IndexedHostLookup",
+    "IndexedServiceObservation",
     "EmailSecurityObservation",
     "SecurityAssurance",
     "SecurityControlClaim",
