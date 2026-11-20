@@ -115,16 +115,46 @@ def test_same_certificate_from_other_sources_is_one_row(session_factory, store, 
     assert count(session_factory, Certificate) == before
 
 
-def test_unreachable_database_is_tried_once_then_skipped(session_factory, store, acme):
-    client, _, connects = db({}, fail_connect=OSError("connection refused"))
+def test_unreachable_database_waits_before_trying_again(session_factory, store, acme):
+    client, _, connects = db({}, fail_connect=OSError("connection refused"), backoff_s=0)
     fallback, calls = crtsh({"acme.example": [(200, ACME)], "globex.example": [(200, [])]})
     run, _ = collect(session_factory, store, {}, ["acme", "acme.example"], ["globex", "globex.example"],
                      clients=[client, fallback])
-    assert run.status == "succeeded" and len(connects) == 1
+    assert run.status == "succeeded" and len(connects) == 3  # 3 attempts for the first domain, none for the next
     assert calls == ["acme.example", "globex.example"]
     with session_factory() as s:
         lookups = s.scalars(select(CtLookup).order_by(CtLookup.id)).all()
-    assert all("database not reachable" in lk.message for lk in lookups)
+    assert "connection refused" in lookups[0].message and "trying again in" in lookups[1].message
+
+
+def test_database_given_up_after_repeated_outages(session_factory, store, acme):
+    client, _, connects = db({}, fail_connect=OSError("connection refused"), backoff_s=0, connect_attempts=2,
+                             retry_after_s=0, max_outages=2)
+    fallback, _ = crtsh({"acme.example": [(200, ACME)], "globex.example": [(200, [])]})
+    collect(session_factory, store, {}, ["acme", "acme.example"], ["globex", "globex.example"],
+            clients=[client, fallback])
+    assert len(connects) == 4 and client._down and "not tried again" in client._down
+    assert client.search("acme.example").message == client._down and len(connects) == 4
+
+
+def test_connection_prefers_ipv4_and_reports_every_attempt(monkeypatch):
+    import psycopg
+
+    from cyber_risk_intelligence.ct import crtsh_db
+
+    tried = []
+
+    def fake_connect(**kw):
+        tried.append(kw.get("hostaddr"))
+        raise psycopg.OperationalError(f"refused at {kw.get('hostaddr') or 'any'}")
+
+    monkeypatch.setattr(crtsh_db.socket, "getaddrinfo",
+                        lambda *a, **k: [(2, 1, 6, "", ("91.199.212.73", 5432)), (2, 1, 6, "", ("91.199.212.73", 5432))])
+    monkeypatch.setattr(psycopg, "connect", fake_connect)
+    with pytest.raises(ConnectionError) as err:
+        CrtShDbClient()._psycopg_connect()
+    assert tried == ["91.199.212.73", None]
+    assert "91.199.212.73: refused at 91.199.212.73" in str(err.value) and "crt.sh: refused at any" in str(err.value)
 
 
 def test_failed_query_falls_through_and_reconnects(session_factory, store, acme):

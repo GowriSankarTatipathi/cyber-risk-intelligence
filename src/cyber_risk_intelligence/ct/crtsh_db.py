@@ -9,10 +9,13 @@ domain with thousands of certificates answers in seconds, with no paging and no 
   SHA-256 of its to-be-signed part with the CT extensions removed (``x509_tbscert_strip_ct_ext``), which
   is how Cert Spotter identifies a certificate, so one seen by both indexes is stored once.
 * The guest database is shared and sometimes refuses connections or cancels long queries. A failed
-  query is ``lookup_failed`` (the job then asks Cert Spotter), never "no certificates". If the
-  database can't be reached at all (port 5432 blocked, server down), the client stops trying for the
-  rest of the run instead of waiting on every domain. So does a query the server rejects as not
-  fitting its schema (SQLSTATE class 42), which would fail the same way for every domain.
+  query is ``lookup_failed`` (the job then asks Cert Spotter), never "no certificates".
+* Connecting goes to crt.sh's IPv4 addresses first (an IPv6 route that is advertised but broken is
+  common on home networks), and is tried ``connect_attempts`` times with a growing pause. If it still
+  fails, the domains in the next ``retry_after_s`` seconds go straight to the other sources, then the
+  database is tried again; after ``max_outages`` such outages it is left alone for the rest of the run.
+  A query the server rejects as not fitting its schema (SQLSTATE class 42), which would fail the same
+  way for every domain, also stops it for the run.
 * By default only the **newest certificate for each host name** is kept (``latest_per_name``): every
   name the domain has a current certificate for is still found, but a name renewed every 90 days, or
   covered by hundreds of near-identical certificates, gives one certificate, not hundreds. The
@@ -29,6 +32,8 @@ from __future__ import annotations
 import json
 import logging
 import os
+import socket
+import time
 from urllib.parse import urlencode
 
 from .entries import CtEntry, CtLookupResult, names_of, when
@@ -108,24 +113,58 @@ class CrtShDbClient:
     source = "crt.sh"  # the same index as the web search; request_url says it was asked through SQL
 
     def __init__(self, connect=None, max_certs: int | None = None, statement_timeout_s: int = 300,
-                 connect_timeout_s: int = 15, latest_per_name: bool = True):
+                 connect_timeout_s: int = 15, latest_per_name: bool = True, connect_attempts: int = 3,
+                 backoff_s: float = 5.0, retry_after_s: float = 300.0, max_outages: int = 3):
         self._connect = connect or self._psycopg_connect
         self.max_certs = max_certs or int(os.environ.get("CT_DB_MAX_CERTS") or 300_000)
         self.statement_timeout_s, self.connect_timeout_s = statement_timeout_s, connect_timeout_s
+        self.connect_attempts, self.backoff_s = connect_attempts, backoff_s
+        self.retry_after_s, self.max_outages = retry_after_s, max_outages
         self._conn = None
-        self._down: str | None = None  # why the database can't be reached; set once, then not retried
+        self._down: str | None = None  # set when the database is given up on for the rest of the run
+        self._last_error: str | None = None
+        self._outages = 0
+        self._retry_at = 0.0
         self._with_tbs = True
         self.latest_per_name = latest_per_name
+
+    def _sleep(self, seconds: float) -> None:
+        if seconds > 0:
+            time.sleep(seconds)
+
+    @staticmethod
+    def _addresses() -> list[str | None]:
+        """crt.sh's IPv4 addresses, then None (let libpq choose, IPv6 included)."""
+        try:
+            infos = socket.getaddrinfo(HOST, PORT, socket.AF_INET, socket.SOCK_STREAM)
+        except OSError:
+            infos = []
+        return [*dict.fromkeys(i[4][0] for i in infos), None]
 
     def _psycopg_connect(self):
         import psycopg
 
-        return psycopg.connect(host=HOST, port=PORT, user=USER, dbname=DBNAME, autocommit=True,
-                               connect_timeout=self.connect_timeout_s, application_name="cyber-risk-intelligence")
+        errors = []
+        for addr in self._addresses():
+            extra = {"hostaddr": addr} if addr else {}
+            try:
+                return psycopg.connect(host=HOST, port=PORT, user=USER, dbname=DBNAME, autocommit=True,
+                                       connect_timeout=self.connect_timeout_s,
+                                       application_name="cyber-risk-intelligence", **extra)
+            except psycopg.OperationalError as exc:
+                errors.append(f"{addr or HOST}: {' '.join(str(exc).split())}")
+        raise ConnectionError("; ".join(errors))
 
     def _connection(self):
         if self._conn is None or getattr(self._conn, "closed", False):
-            self._conn = self._connect()
+            for attempt in range(self.connect_attempts):
+                try:
+                    self._conn = self._connect()
+                    break
+                except Exception:
+                    if attempt + 1 >= self.connect_attempts:
+                        raise
+                    self._sleep(self.backoff_s * (attempt + 1))
             try:
                 self._conn.execute(f"SET statement_timeout = '{int(self.statement_timeout_s)}s'")
             except Exception as exc:  # noqa: BLE001 - the server's own limit applies then
@@ -158,13 +197,27 @@ class CrtShDbClient:
     def search(self, domain: str) -> CtLookupResult:
         url = request_url(domain)
         if self._down:
-            return CtLookupResult(self.source, "lookup_failed", url, None, f"database not reachable: {self._down}")
+            return CtLookupResult(self.source, "lookup_failed", url, None, self._down)
+        wait = self._retry_at - time.monotonic()
+        if wait > 0:
+            return CtLookupResult(self.source, "lookup_failed", url, None,
+                                  f"database not reachable ({self._last_error}); trying again in {wait:.0f} s")
         try:
             self._connection()
         except Exception as exc:  # noqa: BLE001 - any connection failure means the same thing
-            self._down = f"{type(exc).__name__}: {exc}".strip()[:300]
-            log.warning("crt.sh database not reachable (%s); using the other CT sources for this run", self._down)
-            return CtLookupResult(self.source, "lookup_failed", url, None, f"database not reachable: {self._down}")
+            self._outages += 1
+            self._last_error = " ".join(f"{type(exc).__name__}: {exc}".split())[:1000]
+            if self._outages >= self.max_outages:
+                self._down = f"database not reachable ({self._last_error}); not tried again this run"
+                log.warning("crt.sh database not reachable %d times (%s); using the other CT sources for the rest "
+                            "of this run", self._outages, self._last_error)
+            else:
+                self._retry_at = time.monotonic() + self.retry_after_s
+                log.warning("crt.sh database not reachable (%s); using the other CT sources, trying it again "
+                            "in %.0f s", self._last_error, self.retry_after_s)
+            return CtLookupResult(self.source, "lookup_failed", url, None,
+                                  f"database not reachable ({self._last_error})")
+        self._outages = 0
         try:
             rows = self._rows(domain)
         except Exception as exc:  # noqa: BLE001 - cancelled query, dropped connection, server busy
