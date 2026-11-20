@@ -149,3 +149,58 @@ class EmailSecurityObservation(IdMixin, Base):
         CheckConstraint("control = 'spf' OR (all_qualifier IS NULL AND mechanisms IS NULL)",
                         name="spf_fields_only_for_spf"),
     )
+
+
+DKIM_OUTCOMES = (
+    "key_found",          # a DKIM key is published at this selector
+    "revoked",            # a record with an empty key (p=): the key was withdrawn
+    "invalid",            # a record that is not a usable DKIM key
+    "not_found",          # nothing at this selector; says nothing about other selectors
+    "lookup_failed",      # timeout, SERVFAIL, network error: unknown
+    "no_known_selector",  # no selector is known from public evidence: unknown, never "no DKIM"
+)
+DKIM_SELECTOR_SOURCES = ("spf_provider", "published")
+
+
+class DkimEvidence(IdMixin, Base):
+    """Issue 23.3: DKIM keys at selectors known from public evidence (see ``email_security.dkim``)."""
+
+    __tablename__ = "dkim_evidence"
+
+    company_id: Mapped[int | None] = mapped_column(
+        BigInteger, ForeignKey("companies.id", ondelete="RESTRICT"), index=True
+    )
+    domain_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("domains.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    selector: Mapped[str | None] = mapped_column(Text)
+    selector_source: Mapped[str | None] = mapped_column(Text)
+    selector_evidence: Mapped[str | None] = mapped_column(Text)  # why this selector is known, in words
+    selector_source_url: Mapped[str | None] = mapped_column(Text)  # provider documentation or the published source
+    dns_record_id: Mapped[int | None] = mapped_column(
+        BigInteger, ForeignKey("dns_security_records.id", ondelete="RESTRICT"), index=True
+    )
+    outcome: Mapped[str] = mapped_column(Text, nullable=False)
+    key_type: Mapped[str | None] = mapped_column(Text)
+    key_bits: Mapped[int | None] = mapped_column(Integer)
+    record_text: Mapped[str | None] = mapped_column(Text)
+    problem: Mapped[str | None] = mapped_column(Text)
+    observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    evidence_version_id: Mapped[int | None] = mapped_column(
+        BigInteger, ForeignKey("evidence_versions.id", ondelete="RESTRICT"), index=True
+    )
+    ingestion_run_id: Mapped[int | None] = mapped_column(
+        BigInteger, ForeignKey("ingestion_runs.id", ondelete="SET NULL"), index=True
+    )
+
+    __table_args__ = (
+        CheckConstraint(in_list("outcome", DKIM_OUTCOMES), name="outcome"),
+        CheckConstraint("selector_source IS NULL OR " + in_list("selector_source", DKIM_SELECTOR_SOURCES),
+                        name="selector_source"),
+        CheckConstraint("(outcome = 'no_known_selector') = (selector IS NULL)", name="selector_unless_none_known"),
+        CheckConstraint("(selector IS NULL) = (selector_source IS NULL)", name="selector_has_source"),
+        CheckConstraint("(selector IS NULL) = (dns_record_id IS NULL)", name="lookup_per_selector"),
+        CheckConstraint("outcome <> 'key_found' OR key_type IS NOT NULL", name="key_type_when_found"),
+        CheckConstraint("selector IS NULL OR selector ~ '^[A-Za-z0-9_-]+(\\.[A-Za-z0-9_-]+)*$'",
+                        name="selector_label"),
+    )
