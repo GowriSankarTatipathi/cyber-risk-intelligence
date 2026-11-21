@@ -287,7 +287,14 @@ def _collect_nvd(sf, args) -> int:
     try:
         r = run_import(sf, store_from_env(), job, content, source_url="db:tracked_cves")
     except IngestionFailed as exc:
-        print(f"{exc}. See ingestion_errors (run_id = {exc.run_id}).")
+        from .nvd import NvdKeyRejected
+
+        if isinstance(exc.__cause__, NvdKeyRejected):
+            print(f"{exc.__cause__}. Nothing was recorded for the CVEs. A new key works only after you click the "
+                  "activation link in NVD's email; check NVD_API_KEY in .env for a typo, or remove that line to "
+                  "run without a key (slower).")
+        else:
+            print(f"{exc}. See ingestion_errors (run_id = {exc.run_id}).")
         return 2
     print(f"run {r.id} {r.status}: {r.rows_seen} CVEs, {job.tally['found']} found, {job.tally['not_found']} not in NVD, "
           f"{job.tally['lookup_failed']} lookups failed (retried next run); {r.rows_inserted} new, "

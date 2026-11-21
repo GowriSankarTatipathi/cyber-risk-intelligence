@@ -7,9 +7,11 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import httpx
+import pytest
 from sqlalchemy import select, text, update
 
 from cyber_risk_intelligence.ingest import run_import
+from cyber_risk_intelligence.ingest.framework import IngestionFailed
 from cyber_risk_intelligence.models import (
     CvssScore,
     Vulnerability,
@@ -19,6 +21,7 @@ from cyber_risk_intelligence.vulnerabilities.__main__ import nvd_summary, priori
 from cyber_risk_intelligence.vulnerabilities.nvd import (
     NvdClient,
     NvdJob,
+    NvdKeyRejected,
     affected,
     cvss_rows,
     impact_class,
@@ -202,7 +205,32 @@ def test_a_failed_first_lookup_is_recorded_and_retried(session_factory, store, a
 def test_client_pause_depends_on_the_key():
     assert NvdClient(httpx.Client(), api_key="").pause == 6.5
     assert NvdClient(httpx.Client(), api_key="k").pause == 0.7
-    assert nvd({"CVE-2026-0009": 404}).cve("CVE-2026-0009").outcome == "not_found"
+    # an unknown CVE is a 200 with no results; a bare 404 says nothing about the CVE
+    assert nvd({"CVE-2026-0009": None}).cve("CVE-2026-0009").outcome == "not_found"
+    assert nvd({"CVE-2026-0009": 404}).cve("CVE-2026-0009").outcome == "lookup_failed"
+
+
+def test_a_rejected_api_key_stops_the_run_and_records_nothing(session_factory, store):
+    def handler(request):
+        return httpx.Response(404, headers={"message": "Invalid apiKey."})
+    client = NvdClient(httpx.Client(transport=httpx.MockTransport(handler)), api_key="wrong", pause=0, backoff_s=0)
+    with pytest.raises(IngestionFailed) as failed:
+        run(session_factory, store, client, "CVE-2026-0001", "CVE-2026-0002")
+    assert isinstance(failed.value.__cause__, NvdKeyRejected) and "Invalid apiKey" in str(failed.value.__cause__)
+    with session_factory() as s:
+        assert s.scalars(select(Vulnerability)).all() == []
+
+
+def test_cves_nvd_did_not_find_are_asked_again(session_factory, store, acme):
+    db = {**DB, "192.0.2.10": (200, {**DB["192.0.2.10"][1], "vulns": ["CVE-2026-0001"]})}
+    collect(session_factory, store, DNS, db, MX)
+    run(session_factory, store, nvd({"CVE-2026-0001": None}), "CVE-2026-0001")
+    with session_factory() as s:
+        assert s.scalar(select(Vulnerability.outcome)) == "not_found"
+        assert targets_csv(s).count(b"CVE-2026-0001") == 1
+    run(session_factory, store, nvd({"CVE-2026-0001": record("CVE-2026-0001")}), "CVE-2026-0001")
+    with session_factory() as s:
+        assert s.scalar(select(Vulnerability.outcome)) == "found" and targets_csv(s) == b"cve_id\r\n"
 
 
 def test_priority_ranks_kev_then_what_the_cve_allows(session_factory, store, acme, capsys):

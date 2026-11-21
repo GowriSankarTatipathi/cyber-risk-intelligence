@@ -36,6 +36,7 @@ from ..ingest.framework import (
     RowStatus,
     Rule,
     SourceSpec,
+    TransientError,
     WriteContext,
     ensure_source,
 )
@@ -65,6 +66,10 @@ INPUT_SOURCE = SourceSpec(source_key="tracked_cves", name="Tracked CVEs (exposur
                           access_method="other", notes="CVE ids chosen from the database for an NVD run.")
 _CVE = re.compile(CVE_PATTERN)
 MAX_PRODUCTS = 200
+
+
+class NvdKeyRejected(TransientError):
+    """NVD refused the API key (``NVD_API_KEY``): wrong, expired or not activated yet."""
 
 
 @dataclass
@@ -123,9 +128,13 @@ class NvdClient:
                 if not items:
                     return NvdRecord("not_found", cve_id, url, message="NVD has no record for this CVE")
                 return NvdRecord("found", cve_id, url, cve=items[0].get("cve") or {})
-            problem = f"HTTP {r.status_code}"
-            if r.status_code == 404:
-                return NvdRecord("not_found", cve_id, url, message=problem)
+            note = r.headers.get("message") or ""
+            problem = f"HTTP {r.status_code}" + (f" ({note})" if note else "")
+            if "apikey" in note.lower():
+                # NVD answers 404 "Invalid apiKey." for a wrong or not yet activated key: every lookup
+                # would fail the same way, so the run stops instead of recording thousands of them.
+                raise NvdKeyRejected(f"NVD rejected the API key: {note}")
+            # An unknown CVE is a 200 with no results; any other status says nothing about the CVE.
             if r.status_code not in (403, 429) and r.status_code < 500:  # NVD answers 403 when rate limited
                 break
         return NvdRecord("lookup_failed", cve_id, url, message=problem)
@@ -223,15 +232,15 @@ def impact_class(vector: str | None) -> str:
 
 
 def targets_csv(session, refresh_days: int = 30, limit: int | None = None) -> bytes:
-    """Tracked CVEs that need an NVD lookup: never looked up, last lookup failed, or older than
-    ``refresh_days``. CVEs Shodan inferred in the exposure lookups come first (they feed the priority
+    """Tracked CVEs that need an NVD lookup: never looked up, last lookup failed or found nothing (asked
+    again every run; there are few), or a record older than ``refresh_days``. CVEs Shodan inferred in the exposure lookups come first (they feed the priority
     list), then the KEV-only ones; newest CVE ids first within each."""
     tracked = tracked_cves(session)
     exposure = set(session.scalars(text(
         "SELECT DISTINCT upper(v) FROM indexed_host_lookups, jsonb_array_elements_text(potential_vulns) AS v")).all())
     since = datetime.now(UTC) - timedelta(days=refresh_days)
     fresh = set(session.scalars(text(
-        "SELECT cve_id FROM vulnerabilities WHERE outcome <> 'lookup_failed' AND retrieved_at >= :since"),
+        "SELECT cve_id FROM vulnerabilities WHERE outcome = 'found' AND retrieved_at >= :since"),
         {"since": since}).all())
 
     def order(cve: str):
