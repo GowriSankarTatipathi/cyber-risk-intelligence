@@ -263,3 +263,20 @@ def test_priority_ranks_kev_then_what_the_cve_allows(session_factory, store, acm
     assert "1 leads have no NVD record yet" in out
     nvd_summary(session_factory)
     assert "4 found, 0 not in NVD, 0 lookups failed, 1 not looked up yet" in capsys.readouterr().out
+
+
+def test_an_example_password_in_a_description_is_kept_but_a_real_token_is_not(session_factory, store):
+    quoted = record("CVE-2023-25717")
+    quoted["descriptions"] = [{"lang": "en", "value": "RCE as demonstrated by a "
+                               "/forms/doLogin?login_username=admin&password=password$(curl substring."}]
+    leaked = record("CVE-2026-0009")
+    leaked["descriptions"] = [{"lang": "en", "value": "Key " + "AKIA" + "ABCDEFGHIJKLMNOP" + " shipped in builds."}]
+    r, _ = run(session_factory, store, nvd({"CVE-2023-25717": quoted, "CVE-2026-0009": leaked}),
+               "CVE-2023-25717", "CVE-2026-0009")
+    assert (r.rows_inserted, r.rows_rejected) == (1, 1)
+    with session_factory() as s:
+        kept = s.scalar(select(Vulnerability).where(Vulnerability.cve_id == "CVE-2023-25717"))
+        assert kept.outcome == "found" and "password=password" in kept.description
+        assert s.scalar(select(Vulnerability).where(Vulnerability.cve_id == "CVE-2026-0009")) is None
+        err = s.execute(text("SELECT code FROM ingestion_errors WHERE row_key = 'CVE-2026-0009'")).scalar()
+        assert err == "withheld"

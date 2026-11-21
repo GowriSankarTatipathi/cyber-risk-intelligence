@@ -1,5 +1,6 @@
 """Record, link and read evidence."""
 
+from collections.abc import Collection
 from datetime import datetime
 
 from sqlalchemy import func, select
@@ -30,16 +31,19 @@ def record_evidence(
     archive_url: str | None = None,
     archive_captured_at: datetime | None = None,
     notes: str | None = None,
+    allow_secret_kinds: Collection[str] = (),
 ) -> EvidenceVersion:
     """Store ``content`` and record that it was captured from ``source_url``.
 
     Unknown dates stay NULL. Capturing the same bytes from the same URL again only
     moves ``last_seen_at``; different bytes create a new version, so history is kept.
     Raises ``SecretDetected`` (nothing stored) if the content looks like it holds credentials.
+    ``allow_secret_kinds`` names patterns a source is known to trip on harmlessly (for example
+    NVD descriptions quoting an exploit URL with ``password=...``); every other pattern still blocks.
     """
     if not source.is_permitted:
         raise PermissionError(f"Source {source.source_key!r} is not permitted for collection")
-    kinds = find_secrets(content)
+    kinds = [k for k in find_secrets(content) if k not in allow_secret_kinds]
     if kinds:
         raise SecretDetected(kinds)
 
