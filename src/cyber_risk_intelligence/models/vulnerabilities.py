@@ -1,4 +1,5 @@
-"""Issue 5.1: CISA Known Exploited Vulnerabilities (KEV); issue 5.2: FIRST EPSS scores (``EpssScore``).
+"""Issue 5.1: CISA Known Exploited Vulnerabilities (KEV); 5.2: FIRST EPSS scores (``EpssScore``);
+5.3: NVD records, CVSS scores and CWE weaknesses (``Vulnerability``, ``CvssScore``, ``VulnerabilityWeakness``).
 
 * ``kev_catalog_releases``: one row per catalog release CISA published that we imported: its version,
   release time, entry count and the stored snapshot (evidence) of the whole catalog.
@@ -114,4 +115,99 @@ class EpssScore(IdMixin, Base):
         CheckConstraint(f"cve_id ~ '{CVE_PATTERN}'", name="cve_id_format"),
         CheckConstraint("epss >= 0 AND epss <= 1", name="epss_range"),
         CheckConstraint("percentile >= 0 AND percentile <= 1", name="percentile_range"),
+    )
+
+
+NVD_OUTCOMES = ("found", "not_found", "lookup_failed")
+CVSS_VERSIONS = ("2.0", "3.0", "3.1", "4.0")
+
+
+class Vulnerability(IdMixin, Base):
+    """Issue 5.3: one CVE as the NVD describes it.
+
+    ``outcome`` says how the last NVD lookup ended: ``found``, ``not_found`` (NVD has no record) or
+    ``lookup_failed`` (no answer; unknown, retried next run). ``vuln_status`` is NVD's own status
+    (Analyzed, Modified, Awaiting Analysis, Deferred, Rejected ...): a record NVD hasn't analysed may
+    have no score, which stays missing rather than guessed. ``affected_products`` are the vendor:product
+    pairs NVD lists as vulnerable; ``references`` are NVD's links. ``evidence_version_id`` is the stored
+    NVD record these values came from; earlier versions stay in earlier evidence.
+    """
+
+    __tablename__ = "vulnerabilities"
+
+    cve_id: Mapped[str] = mapped_column(Text, nullable=False, unique=True)
+    outcome: Mapped[str] = mapped_column(Text, nullable=False)
+    vuln_status: Mapped[str | None] = mapped_column(Text)
+    source_identifier: Mapped[str | None] = mapped_column(Text)  # who assigned the CVE (the CNA)
+    description: Mapped[str | None] = mapped_column(Text)
+    published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_modified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    affected_products: Mapped[list | None] = mapped_column(JSONB(none_as_null=True))
+    affected_cpe_count: Mapped[int | None] = mapped_column(Integer)
+    references: Mapped[list | None] = mapped_column(JSONB(none_as_null=True))
+    message: Mapped[str | None] = mapped_column(Text)
+    retrieved_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    evidence_version_id: Mapped[int | None] = mapped_column(
+        BigInteger, ForeignKey("evidence_versions.id", ondelete="RESTRICT"), index=True
+    )
+    ingestion_run_id: Mapped[int | None] = mapped_column(
+        BigInteger, ForeignKey("ingestion_runs.id", ondelete="SET NULL"), index=True
+    )
+
+    __table_args__ = (
+        CheckConstraint(f"cve_id ~ '{CVE_PATTERN}'", name="cve_id_format"),
+        CheckConstraint(in_list("outcome", NVD_OUTCOMES), name="outcome"),
+        # A CVE NVD later drops keeps the last record we had as its evidence.
+        CheckConstraint("outcome <> 'found' OR evidence_version_id IS NOT NULL", name="evidence_when_found"),
+    )
+
+
+class CvssScore(IdMixin, Base):
+    """One CVSS assessment of a CVE, always labelled with its CVSS version, who scored it (``source``:
+    NVD or the CNA/ADP) and whether NVD lists it as Primary or Secondary. Versions are never merged."""
+
+    __tablename__ = "cvss_scores"
+
+    vulnerability_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("vulnerabilities.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    cvss_version: Mapped[str] = mapped_column(Text, nullable=False)
+    source: Mapped[str] = mapped_column(Text, nullable=False)
+    score_type: Mapped[str | None] = mapped_column(Text)  # NVD's Primary / Secondary
+    vector_string: Mapped[str] = mapped_column(Text, nullable=False)
+    base_score: Mapped[Decimal] = mapped_column(Numeric(3, 1), nullable=False)
+    base_severity: Mapped[str | None] = mapped_column(Text)
+    attack_vector: Mapped[str | None] = mapped_column(Text)
+    user_interaction: Mapped[str | None] = mapped_column(Text)
+    privileges_required: Mapped[str | None] = mapped_column(Text)
+    exploitability_score: Mapped[Decimal | None] = mapped_column(Numeric(3, 1))
+    impact_score: Mapped[Decimal | None] = mapped_column(Numeric(3, 1))
+    evidence_version_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("evidence_versions.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+
+    __table_args__ = (
+        CheckConstraint(in_list("cvss_version", CVSS_VERSIONS), name="cvss_version"),
+        CheckConstraint("base_score >= 0 AND base_score <= 10", name="base_score_range"),
+    )
+
+
+class VulnerabilityWeakness(IdMixin, Base):
+    """A CWE weakness category NVD or the CNA assigned to a CVE (``NVD-CWE-noinfo`` / ``NVD-CWE-Other``
+    kept as given: they mean "not enough information" / "no fitting CWE")."""
+
+    __tablename__ = "vulnerability_weaknesses"
+
+    vulnerability_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("vulnerabilities.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    cwe_id: Mapped[str] = mapped_column(Text, nullable=False)
+    source: Mapped[str] = mapped_column(Text, nullable=False)
+    weakness_type: Mapped[str | None] = mapped_column(Text)
+    evidence_version_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("evidence_versions.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+
+    __table_args__ = (
+        UniqueConstraint("vulnerability_id", "cwe_id", "source", name="uq_vulnerability_weaknesses_cwe"),
     )

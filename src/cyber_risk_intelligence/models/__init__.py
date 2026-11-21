@@ -31,7 +31,14 @@ from .email_security import (
 )
 from .http_security import HttpSecurityCheck, HttpSecurityObservation
 from .exposure import IndexedHostLookup, IndexedServiceObservation
-from .vulnerabilities import EpssScore, KevCatalogRelease, KevEntry
+from .vulnerabilities import (
+    CvssScore,
+    EpssScore,
+    KevCatalogRelease,
+    KevEntry,
+    Vulnerability,
+    VulnerabilityWeakness,
+)
 from .evidence import EvidenceLink, EvidenceObject, EvidenceVersion, Source
 
 __all__ = [
@@ -49,7 +56,10 @@ __all__ = [
     "HttpSecurityObservation",
     "IndexedHostLookup",
     "IndexedServiceObservation",
+    "CvssScore",
     "EpssScore",
+    "Vulnerability",
+    "VulnerabilityWeakness",
     "KevCatalogRelease",
     "KevEntry",
     "EmailSecurityObservation",
