@@ -39,10 +39,11 @@ from .vulnerabilities import (
     Vulnerability,
     VulnerabilityWeakness,
 )
-from .breaches import BreachSourceAccessNote, PublicBreachMetadata
+from .breaches import AggregateExposureObservation, BreachSourceAccessNote, PublicBreachMetadata
 from .evidence import EvidenceLink, EvidenceObject, EvidenceVersion, Source
 
 __all__ = [
+    "AggregateExposureObservation",
     "BreachSourceAccessNote",
     "PublicBreachMetadata",
     "Certificate",

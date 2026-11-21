@@ -6,6 +6,9 @@
         # the catalogue we hold and the breaches of sites on companies' own domains
     python -m cyber_risk_intelligence.breaches access
         # what HIBP offers, what needs a key or a verified domain, and what we therefore can't see
+    python -m cyber_risk_intelligence.breaches infostealers [--limit N]
+        # Hudson Rock's aggregate infostealer counts for every company domain (about 2 s per domain)
+    python -m cyber_risk_intelligence.breaches infostealer-summary
 
 A breach of a company's site is a public, dated event. It says nothing about the company's staff
 accounts elsewhere, and a company with no breach listed may still have been breached.
@@ -114,6 +117,79 @@ def access(sf) -> None:
     print(f"\nChecked {rows[0].checked_at:%Y-%m-%d} against https://haveibeenpwned.com/API/v3")
 
 
+def infostealer_summary(sf) -> None:
+    with sf() as s:
+        n = s.execute(text(
+            "SELECT count(*) AS domains, "
+            "count(*) FILTER (WHERE l.outcome = 'found') AS found, "
+            "count(*) FILTER (WHERE l.outcome = 'none_reported') AS none_reported, "
+            "count(*) FILTER (WHERE l.id IS NULL AND f.id IS NOT NULL) AS failed_only, "
+            "count(*) FILTER (WHERE l.id IS NULL AND f.id IS NULL) AS not_looked_up "
+            "FROM (SELECT DISTINCT domain_id FROM company_domains WHERE valid_to IS NULL) d "
+            "LEFT JOIN latest_aggregate_exposure l ON l.domain_id = d.domain_id "
+            "LEFT JOIN LATERAL (SELECT id FROM aggregate_exposure_observations x WHERE x.domain_id = d.domain_id "
+            "                   LIMIT 1) f ON true")).one()
+        rows = s.execute(text(
+            "SELECT c.company_key, l.domain_id, dm.name AS domain, l.employees, l.users, l.third_parties, "
+            "l.last_employee_infection_at, l.employee_login_hosts, l.employee_password_strength, l.observed_at "
+            "FROM latest_aggregate_exposure l JOIN companies c ON c.id = l.company_id "
+            "JOIN domains dm ON dm.id = l.domain_id WHERE l.outcome = 'found' "
+            "ORDER BY l.employees DESC NULLS LAST, l.users DESC NULLS LAST, c.company_key")).all()
+    if not n.domains:
+        print("No company domains yet.")
+        return
+    print(f"Infostealer counts (Hudson Rock) for {n.domains} company domains: {n.found} with infections, "
+          f"{n.none_reported} none reported, {n.failed_only} only failed lookups (unknown), "
+          f"{n.not_looked_up} not looked up yet.")
+    if not rows:
+        print("No infections reported yet (or infostealers has not run: "
+              "python -m cyber_risk_intelligence.breaches infostealers).")
+        return
+    print(f"\n{'company':28} {'domain':26} {'employees':>9} {'users':>7} {'3rd pty':>7} {'last employee':13} "
+          "weak emp pw  remote-access / identity login hosts")
+    for r in rows:
+        hosts = [h["host"] for h in r.employee_login_hosts or [] if h.get("hint") in ("remote_access", "identity")]
+        pw = r.employee_password_strength or {}
+        weak = (pw.get("too_weak") or 0) + (pw.get("weak") or 0)
+        weak_s = f"{weak}/{pw['total']}" if pw.get("total") else ""
+        last = f"{r.last_employee_infection_at:%Y-%m-%d}" if r.last_employee_infection_at else ""
+        print(f"{r.company_key[:28]:28} {r.domain[:26]:26} {r.employees or 0:>9} {r.users or 0:>7} "
+              f"{r.third_parties or 0:>7} {last:13} {weak_s:11}  {', '.join(hosts[:4])}"[:200])
+    print("\nEmployees = infected computers with saved logins for the company's own staff login pages; users = "
+          "customer login pages. Counts are Hudson Rock's, from computers infected by infostealer malware (often "
+          "personal devices). They are leads to ask about (password resets, MFA, session revocation), not a "
+          "breach of the company. 'None reported' is not proof of none. Source: Hudson Rock free tools, "
+          "internal research use.")
+
+
+def _collect_infostealers(sf, args) -> int:
+    from .infostealers import InfostealerJob, targets_csv
+
+    with sf() as s:
+        content = targets_csv(s)
+    if args.limit:
+        lines = content.decode().splitlines()
+        content = ("\n".join(lines[: args.limit + 1]) + "\n").encode()
+    todo = content.count(b"\n") - 1
+    if todo <= 0:
+        print("No company domains to look up.")
+        return 2
+    print(f"Asking Hudson Rock's free domain search for {todo} domains, one at a time (about "
+          f"{max(1, round(todo * 2.5 / 60))} min). Only counts and login host names are kept.")
+    store = store_from_env()
+    job = InfostealerJob(store)
+    try:
+        r = run_import(sf, store, job, content, source_url="db:company_domains")
+    except IngestionFailed as exc:
+        print(f"{exc}. See ingestion_errors (run_id = {exc.run_id}).")
+        return 2
+    print(f"run {r.id} {r.status}: {r.rows_seen} domains, {job.tally['found']} with infections, "
+          f"{job.tally['none_reported']} none reported, {job.tally['lookup_failed']} lookups failed (unknown, "
+          f"asked again next run), {r.rows_rejected} rejected")
+    infostealer_summary(sf)
+    return 0 if r.status == "succeeded" and not job.tally["lookup_failed"] else 2
+
+
 def _collect(sf, args) -> int:
     if args.file:
         content, url = args.file.read_bytes(), args.file.resolve().as_uri()
@@ -138,13 +214,17 @@ def _collect(sf, args) -> int:
 
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(prog="python -m cyber_risk_intelligence.breaches")
-    p.add_argument("command", nargs="?", choices=("collect", "summary", "access"), default="summary")
+    p.add_argument("command", nargs="?", default="summary",
+                   choices=("collect", "summary", "access", "infostealers", "infostealer-summary"))
     p.add_argument("--file", type=Path, help="collect: import a saved copy of the catalogue instead of downloading it")
+    p.add_argument("--limit", type=int, help="infostealers: only the first N domains (for a trial run)")
     args = p.parse_args(argv)
     sf = make_session_factory(make_engine())
     if args.command == "collect":
         return _collect(sf, args)
-    (summary if args.command == "summary" else access)(sf)
+    if args.command == "infostealers":
+        return _collect_infostealers(sf, args)
+    {"summary": summary, "access": access, "infostealer-summary": infostealer_summary}[args.command](sf)
     return 0
 
 
