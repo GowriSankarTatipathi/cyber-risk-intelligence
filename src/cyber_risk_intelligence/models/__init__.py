@@ -42,9 +42,12 @@ from .vulnerabilities import (
     VulnerabilityWeakness,
 )
 from .breaches import AggregateExposureObservation, BreachSourceAccessNote, PublicBreachMetadata
+from .incidents import HealthcareBreachCompanyCandidate, HealthcareBreachRecord
 from .evidence import EvidenceLink, EvidenceObject, EvidenceVersion, Source
 
 __all__ = [
+    "HealthcareBreachCompanyCandidate",
+    "HealthcareBreachRecord",
     "AggregateExposureObservation",
     "BreachSourceAccessNote",
     "PublicBreachMetadata",
