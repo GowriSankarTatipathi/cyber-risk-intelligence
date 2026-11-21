@@ -39,9 +39,12 @@ from .vulnerabilities import (
     Vulnerability,
     VulnerabilityWeakness,
 )
+from .breaches import BreachSourceAccessNote, PublicBreachMetadata
 from .evidence import EvidenceLink, EvidenceObject, EvidenceVersion, Source
 
 __all__ = [
+    "BreachSourceAccessNote",
+    "PublicBreachMetadata",
     "Certificate",
     "CertificateHostname",
     "CertificateObservation",
