@@ -31,6 +31,7 @@ from .email_security import (
 )
 from .http_security import HttpSecurityCheck, HttpSecurityObservation
 from .exposure import IndexedHostLookup, IndexedServiceObservation
+from .vulnerabilities import KevCatalogRelease, KevEntry
 from .evidence import EvidenceLink, EvidenceObject, EvidenceVersion, Source
 
 __all__ = [
@@ -48,6 +49,8 @@ __all__ = [
     "HttpSecurityObservation",
     "IndexedHostLookup",
     "IndexedServiceObservation",
+    "KevCatalogRelease",
+    "KevEntry",
     "EmailSecurityObservation",
     "SecurityAssurance",
     "SecurityControlClaim",
