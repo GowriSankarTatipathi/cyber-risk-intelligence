@@ -33,6 +33,7 @@ from .http_security import HttpSecurityCheck, HttpSecurityObservation
 from .exposure import IndexedHostLookup, IndexedServiceObservation
 from .vulnerabilities import (
     CvssScore,
+    EpssCollectionRun,
     EpssScore,
     KevCatalogRelease,
     KevChangeEvent,
@@ -62,6 +63,7 @@ __all__ = [
     "IndexedHostLookup",
     "IndexedServiceObservation",
     "CvssScore",
+    "EpssCollectionRun",
     "EpssScore",
     "Vulnerability",
     "VulnerabilityWeakness",

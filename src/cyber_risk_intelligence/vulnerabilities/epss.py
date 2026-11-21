@@ -11,6 +11,12 @@ in the exposure lookups (10.3) and the CISA KEV entries (5.1). Any other CVE's s
 still in the stored file. A new day adds rows; earlier days are never overwritten. A score outside
 0-1 or a malformed CVE id is rejected into ``ingestion_errors``.
 
+History (issue 12.2): every attempt to collect a day is recorded in ``epss_collection_runs``
+(``imported``, ``not_published`` for a day FIRST has no file for, or ``failed``). ``collect_day`` and
+``backfill`` fill past days. A missing day stays a gap; another day's score is never copied into it.
+If a day's file is published again with different numbers, the newer values are kept and the earlier
+ones are appended to the score's ``corrections``.
+
 An EPSS score is about the CVE, not about a company: it is never a company's chance of a loss.
 """
 
@@ -50,6 +56,10 @@ _HEADER = re.compile(r"model_version:(?P<model>[^,]*),score_date:(?P<when>\S+)")
 class EpssUnavailable(RuntimeError):
     """The day's file could not be downloaded (not published yet, rate limit, server error)."""
 
+    def __init__(self, message: str, status: int | None = None):
+        super().__init__(message)
+        self.status = status
+
 
 def file_url(day: date | None = None) -> str:
     return BASE_URL + (f"epss_scores-{day.isoformat()}.csv.gz" if day else "epss_scores-current.csv.gz")
@@ -65,7 +75,7 @@ class EpssClient:
     def fetch(self, day: date | None = None) -> tuple[str, bytes]:
         """Download one day's file (default: the latest). Returns (final URL, gzipped bytes). A rate
         limit or server error is retried; a missing day (404) is not."""
-        url, problem = file_url(day), "no attempt"
+        url, problem, status = file_url(day), "no attempt", None
         for attempt in range(self.retries):
             if attempt:
                 time.sleep(self.backoff_s * attempt)
@@ -76,10 +86,10 @@ class EpssClient:
                 continue
             if r.status_code == 200:
                 return str(r.url), r.content
-            problem = f"HTTP {r.status_code}"
+            problem, status = f"HTTP {r.status_code}", r.status_code
             if r.status_code != 429 and r.status_code < 500:
                 break
-        raise EpssUnavailable(f"EPSS file not downloaded from {url}: {problem}")
+        raise EpssUnavailable(f"EPSS file not downloaded from {url}: {problem}", status)
 
 
 def tracked_cves(session) -> set[str]:
@@ -156,8 +166,90 @@ class EpssJob(Job):
             return "inserted"
         if all(getattr(row, k) == v for k, v in values.items()):
             return "unchanged"
-        # The same day published again with different numbers: keep the newer file's values.
+        # The same day published again with different numbers: keep the newer file's values and append
+        # the earlier ones to corrections (they also stay in the earlier stored file).
+        earlier = {"epss": str(row.epss), "percentile": str(row.percentile), "model_version": row.model_version,
+                   "scored_at": row.scored_at.isoformat() if row.scored_at else None,
+                   "evidence_version_id": row.evidence_version_id}
+        row.corrections = [*(row.corrections or []), earlier]
         for k, v in values.items():
             setattr(row, k, v)
         row.evidence_version_id, row.ingestion_run_id = ctx.evidence.id, ctx.run.id
         return "updated"
+
+
+def collect_day(session_factory, store, scope: set[str] | None, day: date | None = None,
+                client: EpssClient | None = None, content: bytes | None = None, url: str | None = None):
+    """Collect one scoring day (default: the latest) and record the attempt in ``epss_collection_runs``.
+    Returns (attempt, run, job); ``run`` and ``job`` are None when nothing was imported."""
+    from ..ingest import run_import
+    from ..ingest.framework import IngestionFailed
+    from ..models.vulnerabilities import EpssCollectionRun
+
+    now = datetime.now(UTC)
+    if content is None:
+        try:
+            url, content = (client or EpssClient()).fetch(day)
+        except EpssUnavailable as exc:
+            outcome = "not_published" if exc.status == 404 else "failed"
+            with session_factory() as s:
+                attempt = EpssCollectionRun(score_date=day, outcome=outcome, message=str(exc), file_url=file_url(day),
+                                            attempted_at=now)
+                s.add(attempt)
+                s.commit()
+                s.refresh(attempt)
+                s.expunge(attempt)
+            return attempt, None, None
+    job = EpssJob(scope)
+    try:
+        run = run_import(session_factory, store, job, content, source_url=url or file_url(day))
+    except (IngestionFailed, ValueError, OSError) as exc:
+        with session_factory() as s:
+            attempt = EpssCollectionRun(score_date=day or job.score_date, outcome="failed", message=str(exc)[:500],
+                                        file_url=url, attempted_at=now,
+                                        ingestion_run_id=getattr(exc, "run_id", None))
+            s.add(attempt)
+            s.commit()
+            s.refresh(attempt)
+            s.expunge(attempt)
+        return attempt, None, None
+    with session_factory() as s:
+        if day is not None and job.score_date != day:
+            note = f"asked for {day}, the file is scored {job.score_date}"
+        else:
+            note = None
+        attempt = EpssCollectionRun(score_date=job.score_date, outcome="imported", message=note, file_url=url,
+                                    model_version=job.model_version, rows_in_file=job.rows_in_file,
+                                    rows_stored=run.rows_inserted + run.rows_updated + run.rows_unchanged,
+                                    attempted_at=now, evidence_version_id=run.input_evidence_version_id,
+                                    ingestion_run_id=run.id)
+        s.add(attempt)
+        s.commit()
+        s.refresh(attempt)
+        s.expunge(attempt)
+    return attempt, run, job
+
+
+def imported_days(session, start: date, end: date) -> set[date]:
+    return set(session.scalars(text(
+        "SELECT DISTINCT score_date FROM epss_collection_runs WHERE outcome = 'imported' "
+        "AND score_date BETWEEN :a AND :b"), {"a": start, "b": end}).all())
+
+
+def backfill(session_factory, store, scope: set[str] | None, start: date, end: date,
+             client: EpssClient | None = None, pause: float = 2.0, refetch: bool = False):
+    """Collect every day from ``start`` to ``end`` (inclusive) not yet imported (all of them with
+    ``refetch``). Days FIRST never published are recorded as gaps. Yields each attempt."""
+    from datetime import timedelta
+
+    client = client or EpssClient()
+    with session_factory() as s:
+        done = set() if refetch else imported_days(s, start, end)
+    day, first = start, True
+    while day <= end:
+        if day not in done:
+            if not first and pause:
+                time.sleep(pause)
+            first = False
+            yield collect_day(session_factory, store, scope, day, client)[0]
+        day += timedelta(days=1)

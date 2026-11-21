@@ -88,6 +88,7 @@ class KevEntry(IdMixin, Base):
 
 
 KEV_CHANGE_TYPES = ("added", "updated", "removed")
+EPSS_DAY_OUTCOMES = ("imported", "not_published", "failed")
 
 
 class KevChangeEvent(IdMixin, Base):
@@ -153,6 +154,9 @@ class EpssScore(IdMixin, Base):
     ingestion_run_id: Mapped[int | None] = mapped_column(
         BigInteger, ForeignKey("ingestion_runs.id", ondelete="SET NULL"), index=True
     )
+    # Earlier values for the same CVE and day, kept when the day's file was published again with other
+    # numbers (12.2): [{epss, percentile, model_version, scored_at, evidence_version_id}, ...]
+    corrections: Mapped[list | None] = mapped_column(JSONB(none_as_null=True))
 
     __table_args__ = (
         UniqueConstraint("cve_id", "score_date", name="uq_epss_scores_cve_date"),
@@ -254,4 +258,37 @@ class VulnerabilityWeakness(IdMixin, Base):
 
     __table_args__ = (
         UniqueConstraint("vulnerability_id", "cwe_id", "source", name="uq_vulnerability_weaknesses_cwe"),
+    )
+
+
+class EpssCollectionRun(IdMixin, Base):
+    """Issue 12.2: one attempt to collect one EPSS scoring day.
+
+    ``imported``: the day's file was stored and its tracked scores written. ``not_published``: FIRST has
+    no file for that day (404): a coverage gap, never filled by copying another day's score. ``failed``:
+    download or import error (``message``), asked again on the next run. Days with no ``imported``
+    attempt are gaps in the history.
+    """
+
+    __tablename__ = "epss_collection_runs"
+
+    score_date: Mapped[date | None] = mapped_column(Date, index=True)  # NULL = "latest" asked and failed
+    outcome: Mapped[str] = mapped_column(Text, nullable=False)
+    message: Mapped[str | None] = mapped_column(Text)
+    file_url: Mapped[str | None] = mapped_column(Text)
+    model_version: Mapped[str | None] = mapped_column(Text)
+    rows_in_file: Mapped[int | None] = mapped_column(Integer)
+    rows_stored: Mapped[int | None] = mapped_column(Integer)
+    attempted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    evidence_version_id: Mapped[int | None] = mapped_column(
+        BigInteger, ForeignKey("evidence_versions.id", ondelete="RESTRICT"), index=True
+    )
+    ingestion_run_id: Mapped[int | None] = mapped_column(
+        BigInteger, ForeignKey("ingestion_runs.id", ondelete="SET NULL"), index=True
+    )
+
+    __table_args__ = (
+        CheckConstraint(in_list("outcome", EPSS_DAY_OUTCOMES), name="outcome"),
+        CheckConstraint("outcome <> 'imported' OR (evidence_version_id IS NOT NULL AND score_date IS NOT NULL)",
+                        name="import_has_evidence"),
     )

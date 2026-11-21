@@ -9,6 +9,11 @@
     python -m cyber_risk_intelligence.vulnerabilities epss collect [--date 2026-11-20] [--file f.csv.gz] [--all]
         # FIRST EPSS scores for the day, stored for the tracked CVEs (exposure CVEs + KEV)
     python -m cyber_risk_intelligence.vulnerabilities epss summary
+    python -m cyber_risk_intelligence.vulnerabilities epss backfill --from 2026-10-01 [--to 2026-11-20] [--refetch]
+        # past days' scores for the tracked CVEs; days FIRST never published are recorded as gaps
+    python -m cyber_risk_intelligence.vulnerabilities epss trends [--days 30]
+        # tracked CVEs on companies' own IPs whose EPSS rose most over the period
+    python -m cyber_risk_intelligence.vulnerabilities epss history --cve CVE-2021-40438
         # companies' own-IP CVE leads, known-exploited first, then by EPSS
     python -m cyber_risk_intelligence.vulnerabilities nvd collect [--refresh-days 30] [--limit N]
         # NVD CVSS scores, CWE weaknesses and affected products for the tracked CVEs (NVD_API_KEY speeds it up)
@@ -24,7 +29,7 @@ says the CVE was exploited somewhere. A match means "ask about this", not "this 
 
 import argparse
 import sys
-from datetime import date
+from datetime import UTC, date, datetime
 from pathlib import Path
 
 from sqlalchemy import text
@@ -33,7 +38,7 @@ from ..db import make_engine, make_session_factory
 from ..evidence import store_from_env
 from ..ingest import run_import
 from ..ingest.framework import IngestionFailed
-from .epss import EpssClient, EpssJob, EpssUnavailable, tracked_cves
+from .epss import backfill, collect_day, tracked_cves
 from .kev import KEV_URL, KevClient, KevJob, KevUnavailable, record_removals
 
 OWN = "('company_only', 'unknown')"
@@ -151,6 +156,7 @@ def epss_summary(sf) -> None:
     print("EPSS = estimated probability of exploitation activity against the CVE anywhere in the next 30 days "
           "(FIRST). It is about the CVE, not the company, and is not a probability of loss. "
           "Shodan's CVEs are inferred from software versions and unverified.")
+    epss_coverage(sf)
 
 
 def _import(sf, job, content: bytes, url: str):
@@ -190,30 +196,114 @@ def _collect_kev(sf, args) -> int:
     return 0 if r.status == "succeeded" else 2
 
 
-def _collect_epss(sf, args) -> int:
+def _epss_scope(sf, args):
     with sf() as s:
         scope = None if args.all else tracked_cves(s)
     if scope is not None and not scope:
         print("No CVEs to track yet: run  exposure collect  and/or  vulnerabilities kev collect  first "
               "(or pass --all to store every CVE's score).")
+    return scope
+
+
+def _collect_epss(sf, args) -> int:
+    scope = _epss_scope(sf, args)
+    if scope is not None and not scope:
         return 2
+    content = url = None
     if args.file:
         content, url = args.file.read_bytes(), args.file.resolve().as_uri()
-    else:
-        try:
-            url, content = EpssClient().fetch(args.date)
-        except EpssUnavailable as exc:
-            print(f"{exc}. Nothing was imported; stored scores are unchanged.")
-            return 2
-    job = EpssJob(scope)
-    r = _import(sf, job, content, url)
+    attempt, r, job = collect_day(sf, store_from_env(), scope, args.date, content=content, url=url)
     if r is None:
+        print(f"EPSS {args.date or 'latest'} {attempt.outcome}: {attempt.message}. Nothing was imported; stored "
+              f"scores are unchanged" + (" (a gap for that day)." if attempt.outcome == "not_published" else "."))
         return 2
     print(f"run {r.id} {r.status}: EPSS {job.score_date} (model {job.model_version}), {job.rows_in_file} CVEs in the "
           f"file, {r.rows_seen} tracked: {r.rows_inserted} new, {r.rows_updated} changed, {r.rows_unchanged} unchanged, "
           f"{r.rows_rejected} rejected")
     epss_summary(sf)
     return 0 if r.status == "succeeded" else 2
+
+
+def _backfill_epss(sf, args) -> int:
+    if not args.start:
+        print("epss backfill needs --from YYYY-MM-DD")
+        return 2
+    scope = _epss_scope(sf, args)
+    if scope is not None and not scope:
+        return 2
+    end = args.end or datetime.now(UTC).date()
+    days = (end - args.start).days + 1
+    print(f"EPSS backfill {args.start} .. {end} ({days} days; about 3 MB stored per day, 2 s between downloads).")
+    tally: dict[str, int] = {}
+    for attempt in backfill(sf, store_from_env(), scope, args.start, end, refetch=args.refetch):
+        tally[attempt.outcome] = tally.get(attempt.outcome, 0) + 1
+        extra = f" {attempt.rows_stored} tracked scores" if attempt.outcome == "imported" else f" {attempt.message}"
+        print(f"  {attempt.score_date} {attempt.outcome}{extra}"[:160])
+    print("done: " + (", ".join(f"{k} {v}" for k, v in sorted(tally.items())) or "every day already imported"))
+    epss_coverage(sf)
+    return 0 if not tally.get("failed") else 2
+
+
+def epss_coverage(sf) -> None:
+    with sf() as s:
+        span = s.execute(text("SELECT min(score_date) AS a, max(score_date) AS b, count(DISTINCT score_date) AS n "
+                              "FROM epss_collection_runs WHERE outcome = 'imported'")).one()
+        if span.n == 0:
+            print("No EPSS day imported through the collection log yet.")
+            return
+        gaps = s.execute(text(
+            "SELECT d::date AS day, (SELECT string_agg(DISTINCT r.outcome, '/') FROM epss_collection_runs r "
+            " WHERE r.score_date = d::date) AS tried "
+            "FROM generate_series(CAST(:a AS date), CAST(:b AS date), interval '1 day') d "
+            "WHERE NOT EXISTS (SELECT 1 FROM epss_collection_runs r WHERE r.score_date = d::date "
+            "                  AND r.outcome = 'imported') ORDER BY 1"), {"a": span.a, "b": span.b}).all()
+    print(f"EPSS history: {span.n} days imported from {span.a} to {span.b}; {len(gaps)} gap days"
+          + (": " + ", ".join(f"{g.day} ({g.tried or 'not tried'})" for g in gaps[:15]) if gaps else "."))
+    if len(gaps) > 15:
+        print(f"  ... and {len(gaps) - 15} more. Gaps are never filled with another day's score.")
+
+
+def epss_trends(sf, days: int = 30, limit: int = 40) -> None:
+    with sf() as s:
+        rows = s.execute(text(
+            f"WITH own AS (SELECT DISTINCT c.company_key, upper(v) AS cve_id "
+            f"  FROM ({LATEST_EXPOSURE}) l CROSS JOIN LATERAL jsonb_array_elements_text(l.potential_vulns) v "
+            f"  JOIN companies c ON c.id = l.company_id WHERE l.outcome = 'found' AND l.attribution IN {OWN}), "
+            f"w AS (SELECT cve_id, score_date, epss, "
+            f"  first_value(epss) OVER (PARTITION BY cve_id ORDER BY score_date) AS first_epss, "
+            f"  first_value(score_date) OVER (PARTITION BY cve_id ORDER BY score_date) AS first_day, "
+            f"  row_number() OVER (PARTITION BY cve_id ORDER BY score_date DESC) AS rn "
+            f"  FROM epss_scores WHERE score_date > (SELECT max(score_date) FROM epss_scores) - :d) "
+            f"SELECT w.cve_id, w.first_day, w.first_epss, w.score_date AS last_day, w.epss AS last_epss, "
+            f"  w.epss - w.first_epss AS rise, string_agg(DISTINCT own.company_key, ', ') AS companies, "
+            f"  k.cve_id IS NOT NULL AS kev "
+            f"FROM w JOIN own ON own.cve_id = w.cve_id LEFT JOIN kev_entries k ON k.cve_id = w.cve_id "
+            f"WHERE w.rn = 1 AND w.score_date > w.first_day "
+            f"GROUP BY w.cve_id, w.first_day, w.first_epss, w.score_date, w.epss, k.cve_id "
+            f"ORDER BY rise DESC, w.epss DESC LIMIT :n"), {"d": days, "n": limit}).all()
+    if not rows:
+        print(f"Not enough EPSS history for trends over {days} days: collect daily or run  epss backfill.")
+        return
+    print(f"EPSS change over the last {days} days for CVEs on companies' own IPs (biggest rise first):")
+    print(f"{'cve':16} {'KEV':4} {'from':10} {'epss':>7} {'to':10} {'epss':>7} {'change':>8}  companies")
+    for r in rows:
+        print(f"{r.cve_id:16} {'yes' if r.kev else '':4} {r.first_day!s:10} {r.first_epss:>7.4f} {r.last_day!s:10} "
+              f"{r.last_epss:>7.4f} {r.rise:>+8.4f}  {r.companies}"[:200])
+    print("A rise means FIRST's model sees more exploitation activity likely for the CVE; it is about the CVE, "
+          "not the company.")
+
+
+def epss_history(sf, cve: str) -> None:
+    with sf() as s:
+        rows = s.execute(text("SELECT score_date, epss, percentile, model_version, corrections FROM epss_scores "
+                              "WHERE cve_id = :c ORDER BY score_date"), {"c": cve.upper()}).all()
+    if not rows:
+        print(f"No EPSS scores stored for {cve.upper()} (not tracked, or no day collected yet).")
+        return
+    print(f"EPSS history for {cve.upper()} ({len(rows)} days; days not listed were not collected or not published):")
+    for r in rows:
+        fix = f"  ({len(r.corrections)} earlier value(s) corrected)" if r.corrections else ""
+        print(f"  {r.score_date} {r.epss:.5f}  percentile {r.percentile:.4f}  model {r.model_version}{fix}")
 
 
 def nvd_summary(sf) -> None:
@@ -346,7 +436,12 @@ def _collect_nvd(sf, args) -> int:
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(prog="python -m cyber_risk_intelligence.vulnerabilities")
     p.add_argument("dataset", choices=("kev", "epss", "nvd", "priority"))
-    p.add_argument("command", nargs="?", choices=("collect", "summary", "changes"), default="summary")
+    p.add_argument("command", nargs="?", choices=("collect", "summary", "changes", "backfill", "trends", "history"),
+                   default="summary")
+    p.add_argument("--from", dest="start", type=date.fromisoformat, help="epss backfill: first day")
+    p.add_argument("--to", dest="end", type=date.fromisoformat, help="epss backfill: last day (default: today)")
+    p.add_argument("--refetch", action="store_true", help="epss backfill: also days already imported")
+    p.add_argument("--cve", help="epss history: the CVE")
     p.add_argument("--days", type=int, default=30, help="kev changes: how far back to list")
     p.add_argument("--file", type=Path, help="kev/epss collect: import a saved copy instead of downloading it")
     p.add_argument("--date", type=date.fromisoformat, help="epss collect: the scoring day (default: latest)")
@@ -363,6 +458,18 @@ def main(argv=None) -> int:
         if args.dataset != "kev":
             p.error("changes is only for kev")
         kev_changes(sf, args.days)
+        return 0
+    if args.command in ("backfill", "trends", "history"):
+        if args.dataset != "epss":
+            p.error(f"{args.command} is only for epss")
+        if args.command == "backfill":
+            return _backfill_epss(sf, args)
+        if args.command == "trends":
+            epss_trends(sf, args.days)
+        elif not args.cve:
+            p.error("epss history needs --cve")
+        else:
+            epss_history(sf, args.cve)
         return 0
     if args.command == "summary":
         {"kev": kev_summary, "epss": epss_summary, "nvd": nvd_summary}[args.dataset](sf)
