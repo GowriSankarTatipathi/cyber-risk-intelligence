@@ -68,6 +68,13 @@ _CVE = re.compile(CVE_PATTERN)
 MAX_PRODUCTS = 200
 
 
+# CVE descriptions explain how an attack works and often quote the exploit request, e.g. Ruckus
+# CVE-2023-25717: "/forms/doLogin?login_username=admin&password=password$(curl". That is published
+# example text, not a working secret, so these two patterns don't block an NVD record. Real tokens
+# and keys (AWS, GitHub, private keys ...) still do.
+EXAMPLE_CREDENTIALS = ("password_assignment", "url_with_password")
+
+
 class NvdKeyRejected(TransientError):
     """NVD refused the API key (``NVD_API_KEY``): wrong, expired or not activated yet."""
 
@@ -303,7 +310,7 @@ class NvdJob(Job):
         try:
             version = record_evidence(s, self.store, source=ensure_source(s, NVD_SOURCE), source_url=rec.url,
                                       content=rec.document(), media_type="application/json", http_status=200,
-                                      title=f"NVD record for {cve_id}")
+                                      title=f"NVD record for {cve_id}", allow_secret_kinds=EXAMPLE_CREDENTIALS)
         except SecretDetected as exc:
             raise RowRejected("withheld", f"NVD record for {cve_id} not stored: {exc}", "cve_id") from None
         c = rec.cve or {}
