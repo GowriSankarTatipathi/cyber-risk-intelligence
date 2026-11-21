@@ -1,4 +1,4 @@
-"""Issue 5.1: CISA Known Exploited Vulnerabilities (KEV).
+"""Issue 5.1: CISA Known Exploited Vulnerabilities (KEV); issue 5.2: FIRST EPSS scores (``EpssScore``).
 
 * ``kev_catalog_releases``: one row per catalog release CISA published that we imported: its version,
   release time, entry count and the stored snapshot (evidence) of the whole catalog.
@@ -13,6 +13,7 @@ company is affected.
 """
 
 from datetime import date, datetime
+from decimal import Decimal
 
 from sqlalchemy import (
     BigInteger,
@@ -21,6 +22,7 @@ from sqlalchemy import (
     DateTime,
     ForeignKey,
     Integer,
+    Numeric,
     Text,
     UniqueConstraint,
 )
@@ -80,4 +82,36 @@ class KevEntry(IdMixin, Base):
         CheckConstraint(f"cve_id ~ '{CVE_PATTERN}'", name="cve_id_format"),
         CheckConstraint("known_ransomware_use IS NULL OR " + in_list("known_ransomware_use", RANSOMWARE_USE),
                         name="known_ransomware_use"),
+    )
+
+
+class EpssScore(IdMixin, Base):
+    """Issue 5.2: one FIRST EPSS score for one CVE on one scoring date.
+
+    ``epss`` is the estimated probability (0-1) of exploitation activity against the CVE anywhere in
+    the next 30 days; ``percentile`` (0-1) ranks it among all scored CVEs that day. Both are about
+    the CVE, not about any company: never a company's chance of a loss. A new date adds a row, so
+    past scores are kept.
+    """
+
+    __tablename__ = "epss_scores"
+
+    cve_id: Mapped[str] = mapped_column(Text, nullable=False, index=True)
+    score_date: Mapped[date] = mapped_column(Date, nullable=False)
+    epss: Mapped[Decimal] = mapped_column(Numeric(12, 9), nullable=False)
+    percentile: Mapped[Decimal] = mapped_column(Numeric(12, 9), nullable=False)
+    model_version: Mapped[str | None] = mapped_column(Text)
+    scored_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))  # the file's score_date stamp
+    evidence_version_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("evidence_versions.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    ingestion_run_id: Mapped[int | None] = mapped_column(
+        BigInteger, ForeignKey("ingestion_runs.id", ondelete="SET NULL"), index=True
+    )
+
+    __table_args__ = (
+        UniqueConstraint("cve_id", "score_date", name="uq_epss_scores_cve_date"),
+        CheckConstraint(f"cve_id ~ '{CVE_PATTERN}'", name="cve_id_format"),
+        CheckConstraint("epss >= 0 AND epss <= 1", name="epss_range"),
+        CheckConstraint("percentile >= 0 AND percentile <= 1", name="percentile_range"),
     )
