@@ -1,5 +1,5 @@
 """Issue 5.1: CISA Known Exploited Vulnerabilities (KEV); 5.2: FIRST EPSS scores (``EpssScore``);
-5.3: NVD records, CVSS scores and CWE weaknesses (``Vulnerability``, ``CvssScore``, ``VulnerabilityWeakness``).
+12.1: KEV change events (``KevChangeEvent``); 5.3: NVD records, CVSS scores and CWE weaknesses (``Vulnerability``, ``CvssScore``, ``VulnerabilityWeakness``).
 
 * ``kev_catalog_releases``: one row per catalog release CISA published that we imported: its version,
   release time, entry count and the stored snapshot (evidence) of the whole catalog.
@@ -18,6 +18,7 @@ from decimal import Decimal
 
 from sqlalchemy import (
     BigInteger,
+    Boolean,
     CheckConstraint,
     Date,
     DateTime,
@@ -83,6 +84,49 @@ class KevEntry(IdMixin, Base):
         CheckConstraint(f"cve_id ~ '{CVE_PATTERN}'", name="cve_id_format"),
         CheckConstraint("known_ransomware_use IS NULL OR " + in_list("known_ransomware_use", RANSOMWARE_USE),
                         name="known_ransomware_use"),
+    )
+
+
+KEV_CHANGE_TYPES = ("added", "updated", "removed")
+
+
+class KevChangeEvent(IdMixin, Base):
+    """Issue 12.1: one change to the KEV catalog, seen when a newer catalog release was imported.
+
+    ``added``: the CVE is new in this release (``baseline`` is true for every entry of the very first
+    catalog we imported, so alerts can skip them). ``updated``: CISA changed listed fields (``changed_fields``
+    with ``previous_values`` and ``new_values``; the older values also stay in the older stored catalog).
+    ``removed``: the CVE is no longer in the newest release. An unchanged catalog adds no event.
+    """
+
+    __tablename__ = "kev_change_events"
+
+    cve_id: Mapped[str] = mapped_column(Text, nullable=False, index=True)
+    kev_entry_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("kev_entries.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    release_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("kev_catalog_releases.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    change_type: Mapped[str] = mapped_column(Text, nullable=False)
+    baseline: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
+    changed_fields: Mapped[list | None] = mapped_column(JSONB(none_as_null=True))
+    previous_values: Mapped[dict | None] = mapped_column(JSONB(none_as_null=True))
+    new_values: Mapped[dict | None] = mapped_column(JSONB(none_as_null=True))
+    date_added: Mapped[date | None] = mapped_column(Date)  # CISA's dateAdded at the time of the event
+    required_action: Mapped[str | None] = mapped_column(Text)
+    detected_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    evidence_version_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("evidence_versions.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    ingestion_run_id: Mapped[int | None] = mapped_column(
+        BigInteger, ForeignKey("ingestion_runs.id", ondelete="SET NULL"), index=True
+    )
+
+    __table_args__ = (
+        UniqueConstraint("cve_id", "release_id", "change_type", name="uq_kev_change_events_cve_release_type"),
+        CheckConstraint(in_list("change_type", KEV_CHANGE_TYPES), name="change_type"),
+        CheckConstraint("change_type = 'updated' OR changed_fields IS NULL", name="fields_only_for_updates"),
     )
 
 

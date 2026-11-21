@@ -7,6 +7,11 @@ Re-importing the same file changes nothing. An entry with a malformed CVE id or 
 field (vendor, product, date added, required action) is rejected and recorded in
 ``ingestion_errors``; the rest of the catalog is still imported.
 
+Each import also records changes against the previous release in ``kev_change_events`` (issue 12.1):
+a CVE ``added`` to the catalog, ``updated`` (which fields, old and new values) or, via
+``record_removals`` after the import, ``removed``. An unchanged catalog adds no event; the entries of
+the very first catalog imported are marked ``baseline`` so alerts can skip them.
+
 KEV says a CVE was exploited somewhere. It says nothing about whether a given company is affected.
 """
 
@@ -25,6 +30,7 @@ from ..models.vulnerabilities import (
     CVE_PATTERN,
     RANSOMWARE_USE,
     KevCatalogRelease,
+    KevChangeEvent,
     KevEntry,
 )
 
@@ -131,6 +137,8 @@ class KevJob(Job):
     def __init__(self):
         self.catalog: dict = {}
         self._release_id: int | None = None
+        self._baseline = False
+        self.changes = {"added": 0, "updated": 0}
 
     def parse(self, content: bytes):
         doc = json.loads(content)
@@ -157,6 +165,7 @@ class KevJob(Job):
             KevCatalogRelease.catalog_version == self.catalog["catalog_version"],
             KevCatalogRelease.date_released == self.catalog["date_released"]))
         if rel is None:
+            self._baseline = s.scalar(select(KevCatalogRelease.id).limit(1)) is None
             rel = KevCatalogRelease(**self.catalog, evidence_version_id=ctx.evidence.id, ingestion_run_id=ctx.run.id,
                                     retrieved_at=datetime.now(UTC))
             s.add(rel)
@@ -184,18 +193,70 @@ class KevJob(Job):
         }
         entry = s.scalar(select(KevEntry).where(KevEntry.cve_id == ctx.row.key))
         if entry is None:
-            s.add(KevEntry(cve_id=ctx.row.key, **values, first_seen_release_id=release.id,
-                           last_seen_release_id=release.id, evidence_version_id=ctx.evidence.id))
+            entry = KevEntry(cve_id=ctx.row.key, **values, first_seen_release_id=release.id,
+                             last_seen_release_id=release.id, evidence_version_id=ctx.evidence.id)
+            s.add(entry)
+            s.flush()
+            self._event(ctx, entry, release, "added", baseline=self._baseline)
             return "inserted"
         last = s.get(KevCatalogRelease, entry.last_seen_release_id)
         if last.date_released > release.date_released:  # an older catalog file: keep the newer values
             if s.get(KevCatalogRelease, entry.first_seen_release_id).date_released > release.date_released:
                 entry.first_seen_release_id = release.id
             return "unchanged"
+        was_removed = entry.last_seen_release_id != release.id and s.scalar(
+            select(KevChangeEvent.id).where(KevChangeEvent.kev_entry_id == entry.id,
+                                            KevChangeEvent.change_type == "removed",
+                                            KevChangeEvent.release_id == entry.last_seen_release_id)) is not None
         entry.last_seen_release_id = release.id
-        if all(getattr(entry, k) == v for k, v in values.items()):
-            return "unchanged"
+        changed = [k for k, v in values.items() if getattr(entry, k) != v]
+        if was_removed:  # back in the catalog after CISA removed it
+            self._event(ctx, entry, release, "added")
+        if not changed:
+            return "updated" if was_removed else "unchanged"
+        before = {k: _jsonable(getattr(entry, k)) for k in changed}
         for k, v in values.items():
             setattr(entry, k, v)
         entry.evidence_version_id = ctx.evidence.id
+        self._event(ctx, entry, release, "updated", fields=changed, before=before,
+                    after={k: _jsonable(values[k]) for k in changed})
         return "updated"
+
+    def _event(self, ctx: WriteContext, entry: KevEntry, release: KevCatalogRelease, change_type: str, *,
+               baseline: bool = False, fields=None, before=None, after=None) -> None:
+        ctx.session.add(KevChangeEvent(
+            cve_id=entry.cve_id, kev_entry_id=entry.id, release_id=release.id, change_type=change_type,
+            baseline=baseline, changed_fields=fields, previous_values=before, new_values=after,
+            date_added=entry.date_added, required_action=entry.required_action, detected_at=datetime.now(UTC),
+            evidence_version_id=ctx.evidence.id, ingestion_run_id=ctx.run.id))
+        if not baseline:
+            self.changes[change_type] = self.changes.get(change_type, 0) + 1
+
+
+def _jsonable(value):
+    return value.isoformat() if isinstance(value, date) else value
+
+
+def record_removals(session, run_id: int | None = None) -> int:
+    """After importing the newest release: add a ``removed`` event for each entry that was in the
+    previous release we hold but is not in the newest one (once per entry and release). Returns how many."""
+    releases = session.execute(select(KevCatalogRelease).order_by(
+        KevCatalogRelease.date_released.desc(), KevCatalogRelease.id.desc()).limit(2)).scalars().all()
+    if len(releases) < 2:
+        return 0
+    newest, previous = releases
+    gone = session.scalars(select(KevEntry).where(KevEntry.last_seen_release_id == previous.id)).all()
+    added = 0
+    for entry in gone:
+        exists = session.scalar(select(KevChangeEvent.id).where(
+            KevChangeEvent.kev_entry_id == entry.id, KevChangeEvent.change_type == "removed",
+            KevChangeEvent.release_id == previous.id))
+        if exists is None:
+            # release_id = the last release it was in; the newest release (without it) is the evidence
+            session.add(KevChangeEvent(
+                cve_id=entry.cve_id, kev_entry_id=entry.id, release_id=previous.id, change_type="removed",
+                date_added=entry.date_added, required_action=entry.required_action, detected_at=datetime.now(UTC),
+                evidence_version_id=newest.evidence_version_id, ingestion_run_id=run_id))
+            added += 1
+    session.commit()
+    return added

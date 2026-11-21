@@ -3,6 +3,8 @@
     python -m cyber_risk_intelligence.vulnerabilities kev collect [--file catalog.json]
         # download CISA's KEV catalog (or import a saved copy) into kev_entries
     python -m cyber_risk_intelligence.vulnerabilities kev summary
+    python -m cyber_risk_intelligence.vulnerabilities kev changes [--days 30]
+        # CVEs CISA added, changed or removed in the releases we imported (first catalog = baseline)
         # the catalog we hold, and which CVEs Shodan inferred on companies' own IPs are in KEV
     python -m cyber_risk_intelligence.vulnerabilities epss collect [--date 2026-11-20] [--file f.csv.gz] [--all]
         # FIRST EPSS scores for the day, stored for the tracked CVEs (exposure CVEs + KEV)
@@ -32,7 +34,7 @@ from ..evidence import store_from_env
 from ..ingest import run_import
 from ..ingest.framework import IngestionFailed
 from .epss import EpssClient, EpssJob, EpssUnavailable, tracked_cves
-from .kev import KEV_URL, KevClient, KevJob, KevUnavailable
+from .kev import KEV_URL, KevClient, KevJob, KevUnavailable, record_removals
 
 OWN = "('company_only', 'unknown')"
 LATEST_EXPOSURE = ("SELECT * FROM (SELECT x.*, max(x.ingestion_run_id) OVER (PARTITION BY x.domain_id) AS last_run "
@@ -79,6 +81,36 @@ def kev_summary(sf) -> None:
     print(f"\n{elsewhere} more IP/CVE pairs are on CDN or shared IPs and are not counted against any company.")
     print("Shodan infers CVEs from software versions (unverified, no scan date); KEV means the CVE was exploited "
           "somewhere, not that this company was. Treat each row as a question for the company.")
+
+
+def kev_changes(sf, days: int = 30) -> None:
+    with sf() as s:
+        rows = s.execute(text(
+            f"SELECT e.change_type, e.cve_id, e.changed_fields, e.previous_values, e.new_values, e.date_added, "
+            f"r.catalog_version, r.date_released, k.vendor_project, k.product, k.known_ransomware_use, "
+            f"(SELECT string_agg(DISTINCT c.company_key, ', ') FROM indexed_exposure_kev_matches m "
+            f" JOIN companies c ON c.id = m.company_id WHERE m.cve_id = e.cve_id AND m.attribution IN {OWN}) "
+            f"AS companies "
+            f"FROM kev_change_events e JOIN kev_catalog_releases r ON r.id = e.release_id "
+            f"JOIN kev_entries k ON k.id = e.kev_entry_id "
+            f"WHERE NOT e.baseline AND e.detected_at > now() - make_interval(days => :d) "
+            f"ORDER BY r.date_released DESC, e.change_type, e.cve_id"), {"d": days}).all()
+        baseline = s.scalar(text("SELECT count(*) FROM kev_change_events WHERE baseline"))
+    if not rows:
+        print(f"No KEV changes detected in the last {days} days"
+              + (f" ({baseline} baseline entries from the first catalog)." if baseline else
+                 ": run  kev collect  regularly (e.g. daily) to build the change feed."))
+        return
+    print(f"KEV changes detected in the last {days} days ({len(rows)}):")
+    print(f"{'change':8} {'cve':16} {'release':11} {'ransomware':10} {'on own IPs of':24} vendor / product / what changed")
+    for r in rows:
+        what = f"{r.vendor_project} {r.product}"
+        if r.change_type == "updated":
+            what += "; " + ", ".join(f"{f}: {r.previous_values.get(f)!r} -> {r.new_values.get(f)!r}"
+                                     for f in r.changed_fields or [])
+        print(f"{r.change_type:8} {r.cve_id:16} {r.catalog_version[:11]:11} {r.known_ransomware_use or '?':10} "
+              f"{(r.companies or '')[:24]:24} {what}"[:220])
+    print("'on own IPs of' = companies whose latest exposure lookup lists the CVE (Shodan's inference): ask them first.")
 
 
 def epss_summary(sf) -> None:
@@ -142,8 +174,16 @@ def _collect_kev(sf, args) -> int:
     r = _import(sf, job, content, url)
     if r is None:
         return 2
+    with sf() as s:
+        removed = record_removals(s, r.id)
     print(f"run {r.id} {r.status}: catalog {job.catalog.get('catalog_version')}, {r.rows_seen} entries, "
           f"{r.rows_inserted} new, {r.rows_updated} changed, {r.rows_unchanged} unchanged, {r.rows_rejected} rejected")
+    if job._baseline:
+        print("First catalog imported: its entries are the baseline (no change events to alert on).")
+    else:
+        print(f"Changes since the previous release: {job.changes.get('added', 0)} added, "
+              f"{job.changes.get('updated', 0)} updated, {removed} removed "
+              f"(details:  python -m cyber_risk_intelligence.vulnerabilities kev changes)")
     if r.rows_rejected:
         print(f"Rejected entries are in ingestion_errors (run_id = {r.id}).")
     kev_summary(sf)
@@ -306,7 +346,8 @@ def _collect_nvd(sf, args) -> int:
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(prog="python -m cyber_risk_intelligence.vulnerabilities")
     p.add_argument("dataset", choices=("kev", "epss", "nvd", "priority"))
-    p.add_argument("command", nargs="?", choices=("collect", "summary"), default="summary")
+    p.add_argument("command", nargs="?", choices=("collect", "summary", "changes"), default="summary")
+    p.add_argument("--days", type=int, default=30, help="kev changes: how far back to list")
     p.add_argument("--file", type=Path, help="kev/epss collect: import a saved copy instead of downloading it")
     p.add_argument("--date", type=date.fromisoformat, help="epss collect: the scoring day (default: latest)")
     p.add_argument("--all", action="store_true",
@@ -317,6 +358,11 @@ def main(argv=None) -> int:
     sf = make_session_factory(make_engine())
     if args.dataset == "priority":
         priority(sf)
+        return 0
+    if args.command == "changes":
+        if args.dataset != "kev":
+            p.error("changes is only for kev")
+        kev_changes(sf, args.days)
         return 0
     if args.command == "summary":
         {"kev": kev_summary, "epss": epss_summary, "nvd": nvd_summary}[args.dataset](sf)
